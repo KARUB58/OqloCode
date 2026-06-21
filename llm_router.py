@@ -28,6 +28,7 @@ from typing import Any, Literal
 
 import config
 from config import ModelProfile, Provider, TOKEN_BUDGET
+from telemetry import FinancialVelocityGuard
 from tools_manifest import tools_for_dialect
 
 try:
@@ -288,6 +289,8 @@ class LLMRouter:
         self.max_retries_per_model = max_retries_per_model
         self.session_usage = Usage()
         self.session_cost_usd: float = 0.0
+        # Engine 9: track $/min spend velocity to halt runaway loops.
+        self.cost_guard = FinancialVelocityGuard()
         self.active_model: ModelProfile = self.chain[0]
         # When set, caps output tokens for the next call(s) — used by plan().
         self._output_override: int | None = None
@@ -357,6 +360,7 @@ class LLMRouter:
                     elapsed_ms = (time.perf_counter() - started) * 1000
                     self.session_usage += resp.usage
                     self.session_cost_usd += resp.cost_usd
+                    self.cost_guard.record(resp.cost_usd)
                     self._emit(
                         "success",
                         model=model.name,
@@ -426,11 +430,19 @@ class LLMRouter:
         client = self._require_client()
         ep = model.endpoint
         headers = {"x-api-key": ep.api_key or "", **ep.extra_headers}
+        # Engine 8: mark the stable system prompt and tool manifest as cacheable
+        # so Anthropic prompt-caching reuses those tokens across turns.
+        tools = tools_for_dialect("anthropic")
+        if tools:
+            tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
         body = {
             "model": model.slug,
-            "system": conv.system_prompt,
+            "system": [
+                {"type": "text", "text": conv.system_prompt,
+                 "cache_control": {"type": "ephemeral"}}
+            ],
             "messages": to_anthropic_messages(trim_for_send(conv)),
-            "tools": tools_for_dialect("anthropic"),
+            "tools": tools,
             "max_tokens": self._effective_output(model),
         }
         data = await self._post_json(client, f"{ep.base_url}/messages",

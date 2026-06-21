@@ -8,6 +8,11 @@ python-dotenv>=1.0.1
 # Local WebSocket client used by the Blender live-execution bridge.
 websockets>=12.0
 
+# Optional: richer host telemetry (CPU/RAM). Falls back to stdlib /proc if absent.
+# psutil>=5.9.0
+# Optional: faster vector math for the memory RAG engine. Pure-Python otherwise.
+# numpy>=1.26.0
+
 # Optional provider SDKs. The router works purely over REST via httpx, but if
 # these are installed their typed exceptions are caught natively in the fallback
 # matrix. Install only the ones you use.

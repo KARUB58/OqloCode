@@ -31,6 +31,9 @@ from llm_router import Conversation, LLMRouter
 from orchestrator import Orchestrator, StepRecord
 from skills import Skill, SkillRegistry, seed_example_skills
 from tools_manifest import ALL_TOOLS
+from memory_rag import MemoryRAG
+from telemetry import Telemetry, TelemetryThrottler
+from swarm_bus import SwarmCoordinator
 
 try:
     from rich.console import Console
@@ -71,6 +74,10 @@ class OqloCLI:
         self.bridges = BridgeRouter()
         self.conv = Conversation(config.SYSTEM_PROMPT)
         self.skills = SkillRegistry()
+        # Next-gen engines.
+        self.memory = MemoryRAG()
+        self.telemetry = Telemetry()
+        self.throttle = TelemetryThrottler(telemetry=self.telemetry)
         self.verbose = True
         self.running = True
         self._last_events: list[str] = []
@@ -79,6 +86,10 @@ class OqloCLI:
             "help": self.cmd_help,
             "api": self.cmd_api,
             "local": self.cmd_local,
+            "swarm": self.cmd_swarm,
+            "memory": self.cmd_memory,
+            "telemetry": self.cmd_telemetry,
+            "budget": self.cmd_budget,
             "models": self.cmd_models,
             "chain": self.cmd_chain,
             "policy": self.cmd_policy,
@@ -141,6 +152,12 @@ class OqloCLI:
         if rec.kind == "plan" and rec.text:
             console.print(Panel(rec.text, title="🗺️  plan (token-saver)",
                                 border_style="magenta", box=box.ROUNDED))
+        elif rec.kind == "memory" and rec.text:
+            console.print(Panel(rec.text, title="🧩 memory recall",
+                                border_style="blue", box=box.ROUNDED))
+        elif rec.kind == "freeze":
+            console.print(Panel(rec.text, title="⛔ financial freeze (HITL)",
+                                border_style="red", box=box.HEAVY))
         elif rec.kind == "assistant" and rec.text:
             console.print(Panel(rec.text, title=f"🧠 {rec.model}",
                                 border_style="cyan", box=box.ROUNDED))
@@ -185,6 +202,12 @@ class OqloCLI:
                 ("/tokensave on|off", "Toggle aggressive trimming + lower output caps."),
                 ("/plan on|off", "Toggle the cheap planning pass before execution."),
                 ("/cost", "Session token usage & USD spend."),
+            ],
+            "Next-gen engines": [
+                ("/swarm <task>", "Run the 4-agent swarm (Architect/Blender/Unity/QA)."),
+                ("/memory ...", "Long-term RAG: stats/search <q>/add <text>/forget <id>."),
+                ("/telemetry", "Live CPU/RAM/GPU-VRAM + throttle stats."),
+                ("/budget [limit <usd>|resume]", "Financial velocity guard ($/min)."),
             ],
             "Bridges (terminal-only — never launches apps)": [
                 ("/tools", "LLM-accessible bridge tools."),
@@ -321,6 +344,99 @@ class OqloCLI:
             b.plan_first = args[0] == "on"
         console.print(f"Plan-first: [bold]{'on' if b.plan_first else 'off'}[/]")
 
+    # --- Engine 5: multi-agent swarm ------------------------------------- #
+    async def cmd_swarm(self, args: list[str]) -> None:
+        intent = " ".join(args)
+        if not intent:
+            console.print("[red]Usage: /swarm <task description>[/red]")
+            return
+        console.print(Panel(f"Dispatching swarm: {intent}",
+                            title="🐝 swarm", border_style="yellow", box=box.ROUNDED))
+        coord = SwarmCoordinator(
+            self.bridges, self.memory, throttle=self.throttle,
+            on_event=lambda ev: console.print(
+                f"  [dim]{ev.source:>9}[/] ▸ [bold]{ev.topic}[/]"
+                + (f" [dim]{ev.payload.get('detail','')}[/]"
+                   if ev.payload.get('detail') else "")),
+        )
+        out = await coord.run(intent)
+        color = "green" if out["ok"] else "red"
+        body = (f"ok: {out['ok']}\npipeline: {out['pipeline_id']}\n"
+                f"errors: {out['errors'] or 'none'}")
+        console.print(Panel(body, title="🐝 swarm result",
+                            border_style=color, box=box.ROUNDED))
+
+    # --- Engine 6: long-term memory -------------------------------------- #
+    async def cmd_memory(self, args: list[str]) -> None:
+        sub = args[0] if args else "stats"
+        if sub == "stats":
+            s = self.memory.stats()
+            t = Table(title="Semantic Memory (RAG)", box=box.ROUNDED,
+                      header_style="bold cyan")
+            t.add_column("Metric")
+            t.add_column("Value")
+            for k, v in s.items():
+                t.add_row(k, str(v))
+            console.print(t)
+        elif sub == "search" and len(args) > 1:
+            hits = self.memory.query(" ".join(args[1:]), top_k=5)
+            if not hits:
+                console.print("[dim]No matches.[/dim]")
+                return
+            for h in hits:
+                console.print(f"[green]{h.score:.3f}[/] [{h.record.kind}] "
+                              f"{h.record.text[:120]}")
+        elif sub == "add" and len(args) > 1:
+            rec = self.memory.remember(" ".join(args[1:]), kind="note",
+                                       tags=["manual"])
+            console.print(f"[green]Remembered {rec.id}.[/green]")
+        elif sub == "forget" and len(args) > 1:
+            ok = self.memory.forget(args[1])
+            console.print("[green]Forgotten.[/green]" if ok else "[red]Not found.[/red]")
+        else:
+            console.print("[red]Usage: /memory stats|search <q>|add <text>|forget <id>[/red]")
+
+    # --- Engine 7: telemetry --------------------------------------------- #
+    async def cmd_telemetry(self, _: list[str]) -> None:
+        s = self.telemetry.snapshot()
+        t = Table(title="Host Telemetry", box=box.ROUNDED, header_style="bold cyan")
+        t.add_column("Resource")
+        t.add_column("Value", justify="right")
+        t.add_row("CPU", f"{s.cpu_percent:.1f}%")
+        t.add_row("Memory", f"{s.mem_percent:.1f}% "
+                            f"({s.mem_used_mb:.0f}/{s.mem_total_mb:.0f} MB)")
+        t.add_row("GPU VRAM", s.vram_label)
+        t.add_row("Load avg (1m)",
+                  str(s.load_avg_1m) if s.load_avg_1m is not None else "n/a")
+        t.add_row("Throttle events", str(self.throttle.throttle_events))
+        console.print(t)
+
+    # --- Engine 9: financial velocity guard ------------------------------ #
+    async def cmd_budget(self, args: list[str]) -> None:
+        guard = self.router.cost_guard
+        if args and args[0] == "resume":
+            guard.reset_freeze()
+            console.print("[green]Freeze cleared. Execution may resume.[/green]")
+            return
+        if len(args) >= 2 and args[0] == "limit":
+            try:
+                guard.max_usd_per_min = float(args[1])
+                console.print(f"[green]Limit set to ${guard.max_usd_per_min:.2f}/min.[/green]")
+            except ValueError:
+                console.print("[red]Usage: /budget limit <usd_per_min>[/red]")
+            return
+        frozen, msg = guard.check()
+        t = Table(title="Financial Velocity Guard", box=box.ROUNDED,
+                  header_style="bold cyan")
+        t.add_column("Metric")
+        t.add_column("Value", justify="right")
+        t.add_row("Spend velocity", f"${guard.velocity_per_min():.4f}/min")
+        t.add_row("Limit", f"${guard.max_usd_per_min:.2f}/min")
+        t.add_row("Session total", f"${guard.total_usd:.6f}")
+        t.add_row("State", "[red]FROZEN[/]" if frozen or guard.frozen else "[green]ok[/]")
+        console.print(t)
+        console.print("[dim]/budget limit <usd> · /budget resume[/dim]")
+
     async def cmd_models(self, _: list[str]) -> None:
         t = Table(title="Model Catalogue", box=box.ROUNDED,
                   header_style="bold cyan")
@@ -416,6 +532,14 @@ class OqloCLI:
         t.add_row("Mode", "terminal-only (never launches apps)")
         t.add_row("Token saver", "[green]on[/]" if b.saver_mode else "[red]off[/]")
         t.add_row("Plan-first", "[green]on[/]" if b.plan_first else "[red]off[/]")
+        snap = self.telemetry.snapshot()
+        t.add_row("Host CPU / MEM",
+                  f"{snap.cpu_percent:.0f}% / {snap.mem_percent:.0f}%"
+                  + (f" · VRAM {snap.vram_label}" if snap.vram_percent else ""))
+        t.add_row("Memory records", str(self.memory.stats()["records"]))
+        t.add_row("Budget guard",
+                  f"${self.router.cost_guard.max_usd_per_min:.2f}/min limit"
+                  + (" [red](FROZEN)[/]" if self.router.cost_guard.frozen else ""))
         t.add_row("Blender bridge",
                   "[green]live[/]" if blender_ok else "[yellow]offline (simulated)[/]")
         t.add_row("Unity bridge",
@@ -658,7 +782,8 @@ class OqloCLI:
             await handler(args)
         else:
             orch = Orchestrator(
-                self.router, self.bridges, self.conv, on_step=self._on_step
+                self.router, self.bridges, self.conv,
+                on_step=self._on_step, memory=self.memory,
             )
             try:
                 await orch.run(line)

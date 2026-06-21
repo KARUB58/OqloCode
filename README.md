@@ -100,6 +100,28 @@ Tune everything live with `/tokensave` and `/plan`.
 
 ---
 
+## Next-gen engines
+
+Oqlo Code ships a distributed, hardware-aware, self-optimizing layer on top of
+the orchestrator:
+
+| Engine | Module | What it does |
+|---|---|---|
+| **5 · Multi-Agent Swarm** | `swarm_bus.py` | An async Pub/Sub event bus drives four agents — `ArchitectAgent` (intent → DAG, lifecycle), `BlenderAgent`, `UnityAgent`, and `QAAgent` (errors, healing, learning). Run with `/swarm <task>`. |
+| **6 · Semantic RAG Memory** | `memory_rag.py` | A zero-dependency TF-IDF vector store (NumPy optional) persisted to `~/.oqlo/memory/`. Proven code/themes/layouts are cached and recalled into each new task. `/memory`. |
+| **7 · Resource Telemetry** | `telemetry.py` | Samples CPU / RAM / GPU-VRAM (`psutil`/`nvidia-smi` optional, `/proc` fallback). `TelemetryThrottler` delays async work while the host is choked. `/telemetry`. |
+| **8 · Context Slicing & Caching** | `llm_router.py` | History trimming, tool-output truncation, and Anthropic/OpenAI prompt-cache markers on the stable system prompt + tool manifest. |
+| **9 · Financial Velocity Guard** | `telemetry.py` | Tracks `$/min` spend; if a runaway loop exceeds the limit (default `$2.00/min`) it freezes the graph and hands off to Human-In-The-Loop. `/budget`. |
+| **10 · Sandboxed Pre-Flight QA** | `sandbox.py` | Validates generated `bpy`/C# before it touches a live app: AST scan + mock-execution in a resource-limited subprocess (Python), structural checks (C#). |
+
+How they compose in a normal run: relevant memory is recalled → a cheap plan is
+drafted → each tool result that succeeds is remembered → the cost guard checks
+spend velocity before every model turn → telemetry can throttle heavy steps. In
+`/swarm` mode the QA agent additionally pre-flights every snippet and drives the
+heal loop over the event bus.
+
+---
+
 ## Install
 
 ```bash
@@ -129,6 +151,10 @@ Type `/help` inside the CLI. Highlights:
 | `/tokensave on\|off` | Toggle aggressive token trimming |
 | `/plan on\|off` | Toggle the cheap planning pass |
 | `/cost` | Session token usage & USD spend |
+| `/swarm <task>` | Run the 4-agent swarm pipeline |
+| `/memory ...` | RAG memory: `stats / search / add / forget` |
+| `/telemetry` | Live CPU / RAM / GPU-VRAM stats |
+| `/budget [limit\|resume]` | Financial velocity guard ($/min) |
 | `/tools` | LLM-accessible bridge tools |
 | `/blender <bpy>` | Run a bpy snippet directly |
 | `/unity logs [sev]` | Fetch Unity editor logs |
@@ -174,14 +200,18 @@ Until those are installed and running, every bridge call runs in simulation mode
 config.py            BYOK config, ModelProfile catalogue, PRIORITY_CHAIN, policies
 llm_router.py        Multi-provider async router + canonical↔dialect translation
 tools_manifest.py    Provider-neutral tool specs (rendered per dialect)
-orchestrator.py      The agent loop + self-healing controller
+orchestrator.py      The agent loop + self-healing + memory/cost-guard wiring
 skills.py            User-extensible JSON skill registry
+swarm_bus.py         Engine 5: async event bus + 4 specialized agents
+memory_rag.py        Engine 6: TF-IDF semantic long-term memory
+telemetry.py         Engines 7 & 9: host telemetry, throttling, cost guard
+sandbox.py           Engine 10: pre-flight QA sandbox for bpy/C#
 main.py              Rich-powered interactive terminal
 bridges/
   result.py          Shared ToolResult type
   blender_bridge.py  WebSocket client + in-app addon template
   unity_bridge.py    REST client + in-app editor script template
-  cursor_bridge.py   git-apply patcher + workspace launcher
+  cursor_bridge.py   git-apply patcher (terminal-only, never launches the app)
 ```
 
 ---
