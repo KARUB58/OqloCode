@@ -299,7 +299,7 @@ class LLMRouter:
         # When True, tools are omitted from the request (direct-chat mode).
         self._suppress_tools: bool = False
         self._client: Any = (
-            httpx.AsyncClient(timeout=httpx.Timeout(60.0)) if httpx else None
+            httpx.AsyncClient(timeout=httpx.Timeout(180.0)) if httpx else None
         )
 
     @property
@@ -454,6 +454,14 @@ class LLMRouter:
             body["tool_choice"] = "auto"
         data = await self._post_json(client, f"{ep.base_url}/chat/completions",
                                      headers, body)
+        # OpenRouter returns HTTP 200 with {"error":{...}} when the model pool
+        # is full or the free-tier queue is busy — no "choices" key in that case.
+        if "choices" not in data:
+            err = data.get("error", data)
+            code = int(err.get("code", 429) if isinstance(err, dict) else 429)
+            msg = (err.get("message", str(err)) if isinstance(err, dict)
+                   else str(err))
+            raise ProviderError(code or 429, msg[:300])
         choice = data["choices"][0]["message"]
         tool_calls = [
             ToolCall(

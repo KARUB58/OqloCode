@@ -128,8 +128,12 @@ class OqloCLI:
         if not self.verbose:
             return
         if event == "attempt":
+            free_note = (
+                " [dim italic](:free tier — shared queue, may take 30-90 s)[/]"
+                if ":free" in fields.get("model", "") else ""
+            )
             console.print(
-                f"[dim]→ trying [bold]{fields['model']}[/] "
+                f"[dim]→ trying [bold]{fields['model']}[/]{free_note} "
                 f"(attempt {fields['attempt']})[/dim]"
             )
         elif event == "skip":
