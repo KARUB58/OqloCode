@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+*.egg-info/
+.oqlo/
+oqlo_session.json
+skills/
+unity_project/

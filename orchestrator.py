@@ -1,0 +1,125 @@
+"""Oqlo Code — the closed-loop orchestration engine.
+
+Ties the :class:`LLMRouter` (brain) to the :class:`BridgeRouter` (hands). Runs
+the classic agent loop:
+
+    model -> tool calls -> bridge execution -> results -> model -> ...
+
+until the model stops requesting tools or a step budget is hit. Tool failures
+are *not* terminal: their tracebacks are wrapped as ``[SYSTEM ERROR: ...]`` and
+fed back so the active model can self-heal and re-issue a corrected call.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from bridges import BridgeRouter, ToolResult
+from llm_router import Conversation, LLMResponse, LLMRouter, ToolCall
+
+
+@dataclass(slots=True)
+class StepRecord:
+    """One observable event in an orchestration run, for UI rendering."""
+
+    kind: str  # "assistant" | "tool" | "heal" | "final"
+    text: str = ""
+    tool: str = ""
+    ok: bool = True
+    simulated: bool = False
+    model: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+StepCallback = Callable[[StepRecord], None]
+
+
+class Orchestrator:
+    """Drives a single user request to completion across model + bridges."""
+
+    def __init__(
+        self,
+        router: LLMRouter,
+        bridges: BridgeRouter,
+        conversation: Conversation,
+        *,
+        max_steps: int = 12,
+        max_heals_per_tool: int = 2,
+        on_step: StepCallback | None = None,
+    ) -> None:
+        self.router = router
+        self.bridges = bridges
+        self.conv = conversation
+        self.max_steps = max_steps
+        self.max_heals_per_tool = max_heals_per_tool
+        self.on_step = on_step or (lambda _: None)
+        self._heal_counts: dict[str, int] = {}
+
+    async def run(self, user_input: str) -> str:
+        """Process one compound user request; return the final assistant text."""
+        self.conv.user(user_input)
+        self._heal_counts.clear()
+        final_text = ""
+
+        for _ in range(self.max_steps):
+            response: LLMResponse = await self.router.complete(self.conv)
+            self.conv.assistant(response.text, response.tool_calls)
+
+            if response.text:
+                self._emit(
+                    StepRecord(kind="assistant", text=response.text,
+                               model=response.model.name)
+                )
+
+            if not response.tool_calls:
+                final_text = response.text
+                self._emit(StepRecord(kind="final", text=final_text,
+                                      model=response.model.name))
+                break
+
+            # Execute every requested tool call, feeding results back.
+            for call in response.tool_calls:
+                result = await self._execute_with_heal(call)
+                self.conv.tool_result(call, result.to_model_text())
+        else:
+            final_text = (
+                "Reached the maximum step budget before the task fully resolved. "
+                "Inspect the step log above for where it stalled."
+            )
+            self._emit(StepRecord(kind="final", text=final_text))
+
+        return final_text
+
+    async def _execute_with_heal(self, call: ToolCall) -> ToolResult:
+        """Execute a tool call, tracking self-heal budget per tool name."""
+        result = await self.bridges.execute(call.name, call.arguments)
+        self._emit(
+            StepRecord(
+                kind="tool",
+                tool=call.name,
+                ok=result.ok,
+                simulated=result.simulated,
+                text=result.summary,
+                data=result.data,
+            )
+        )
+        if not result.ok:
+            count = self._heal_counts.get(call.name, 0)
+            if count < self.max_heals_per_tool:
+                self._heal_counts[call.name] = count + 1
+                self._emit(
+                    StepRecord(
+                        kind="heal",
+                        tool=call.name,
+                        ok=False,
+                        text=f"Self-heal attempt {count + 1} queued for "
+                             f"{call.name}: {result.error}",
+                    )
+                )
+            # Either way the error text (wrapped) is returned so the model sees it.
+        return result
+
+    def _emit(self, record: StepRecord) -> None:
+        self.on_step(record)
