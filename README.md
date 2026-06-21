@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="banner.png" alt="Oqlo Code — The Agentic OS Orchestrator" width="100%">
+</p>
+
 # Oqlo Code — The Agentic OS Orchestrator
 
 Oqlo Code is a **free, self-hostable** asynchronous CLI that turns LLMs into
