@@ -85,8 +85,9 @@ class OqloCLI:
         self.verbose = True
         self.running = True
         self._last_events: list[str] = []
-        # Active file editing session (/start <file> sets this).
+        # Active file/directory session (/start <path> sets one of these).
         self.active_file: "Path | None" = None
+        self.active_dir: "Path | None" = None  # directory workspace
         self.commands: dict[str, Callable[[list[str]], Awaitable[None]]] = {
             "start": self.cmd_start,
             "help": self.cmd_help,
@@ -229,15 +230,21 @@ class OqloCLI:
                 ("just type a question", "Chat goes straight to the model — no pipeline."),
                 ("just type an instruction", "Actionable work spins up the agent pipeline."),
             ],
-            "File editing session": [
-                ("/start <file> [task]",
-                 "Open a file session — subsequent plain messages work on "
-                 "this file automatically. E.g. /start app.py add logging"),
-                ("/start clear", "Close the file session."),
-                ("/write [file]",
-                 "Write the last code block from the conversation to the "
-                 "active file (or a specific file)."),
-                ("/file show|clear", "Show or clear the active file session."),
+            "File / directory session (enter full path)": [
+                ("/start /path/to/file.py [task]",
+                 "Open a single-file session — subsequent messages are "
+                 "automatically given the file's content. "
+                 "E.g. /start /home/user/project/app.py add logging"),
+                ("/start /path/to/directory [task]",
+                 "Open a directory session — shows files, resolves "
+                 "filenames mentioned in messages against that dir. "
+                 "E.g. /start /home/user/OqloCode"),
+                ("/start clear", "End the active file/directory session."),
+                ("/write [/path/to/file]",
+                 "Write the last code block from the conversation back to "
+                 "the active file (or any path you specify)."),
+                ("/file show|clear",
+                 "Show info about the active session or clear it."),
             ],
             "Bridges (terminal-only — never launches apps)": [
                 ("/tools", "LLM-accessible bridge tools."),
@@ -266,7 +273,7 @@ class OqloCLI:
             "[dim]Any line without a leading '/' is sent to the orchestrator.[/dim]"
         )
 
-    # --- start / banner / file session ------------------------------------ #
+    # --- start / banner / file-or-directory session ----------------------- #
     async def cmd_start(self, args: list[str]) -> None:
         # /start  OR  /start oqlocode  → show banner + status (existing behaviour)
         if not args or args[0].lower() == "oqlocode":
@@ -276,66 +283,125 @@ class OqloCLI:
             console.print("\n[dim]Type /help for all commands.[/dim]")
             return
 
-        # /start clear → close active file session
+        # /start clear → close the active session
         if args[0].lower() == "clear":
             self.active_file = None
-            console.print("[green]File session cleared.[/green]")
+            self.active_dir = None
+            console.print("[green]Session cleared.[/green]")
             return
 
-        # /start <filepath> [initial task...] → open a file editing session
+        # /start <full-path> [initial task...]
         from pathlib import Path as _Path
-        filepath = _Path(args[0]).expanduser()
+        # Normalise Windows-style backslashes if pasted from Explorer.
+        raw = args[0].replace("\\", "/")
+        target = _Path(raw).expanduser().resolve()
         task = " ".join(args[1:])
 
-        if not filepath.exists():
-            console.print(f"[red]File not found: {filepath}[/red]")
+        if not target.exists():
             console.print(
-                "[dim]Tip: create the file first, then /start it. "
-                "Or use an absolute path.[/dim]"
+                f"[red]Path not found:[/red] {target}\n"
+                f"[dim]Current working directory: {_Path.cwd()}[/dim]\n"
+                "[dim]Tip: use the full/absolute path, "
+                "e.g. /start /home/user/project/main.py[/dim]"
             )
             return
 
-        try:
-            content = filepath.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            console.print(f"[red]Cannot read {filepath}: {exc}[/red]")
+        # ── DIRECTORY ─────────────────────────────────────────────────────
+        if target.is_dir():
+            self.active_dir = target
+            self.active_file = None
+            # List the files for the user.
+            entries = sorted(target.iterdir(), key=lambda p: (p.is_dir(), p.name))
+            t = Table(title=f"📁 {target}", box=box.SIMPLE, header_style="bold cyan")
+            t.add_column("Name")
+            t.add_column("Type")
+            t.add_column("Size", justify="right")
+            for e in entries[:40]:
+                kind = "[blue]dir[/]" if e.is_dir() else "file"
+                size = f"{e.stat().st_size:,} B" if e.is_file() else ""
+                t.add_row(e.name, kind, size)
+            if len(entries) > 40:
+                t.add_row(f"…and {len(entries)-40} more", "", "")
+            console.print(t)
+            console.print(Panel(
+                f"[bold cyan]{target}[/]\n\n"
+                "Directory session open — mention any filename and I'll resolve it "
+                "from this location automatically.\n"
+                "[dim]Example: düzenle main.py içine logging ekle[/dim]\n"
+                "[dim]/start clear  to end · /file show for status[/dim]",
+                title="📁 Directory Session Started",
+                border_style="magenta", box=box.ROUNDED,
+            ))
+            if task:
+                await self._dispatch_with_file(task)
             return
 
-        self.active_file = filepath
+        # ── SINGLE FILE ───────────────────────────────────────────────────
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            console.print(f"[red]Cannot read {target}: {exc}[/red]")
+            return
+
+        self.active_file = target
+        self.active_dir = target.parent  # also set parent dir for context
         lines = content.splitlines()
         console.print(Panel(
-            f"[bold cyan]{filepath.resolve()}[/]\n"
+            f"[bold cyan]{target}[/]\n"
             f"[dim]{len(lines)} lines · {len(content):,} chars[/dim]\n\n"
-            "Now just type your instructions — no need to mention the file again.\n"
-            "[dim]/start clear  to end the session · /write to save the last code block[/dim]",
+            "Just type your instructions — file is auto-injected every turn.\n"
+            "[dim]/start clear  to end · /write to save last code block back[/dim]",
             title="📄 File Session Started",
             border_style="magenta", box=box.ROUNDED,
         ))
-
         if task:
             await self._dispatch_with_file(task)
 
     async def _dispatch_with_file(self, task: str) -> None:
-        """Dispatch a task with the active file's current content injected."""
-        if not self.active_file:
-            return
-        try:
-            content = self.active_file.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            console.print(f"[yellow]Could not re-read active file: {exc}[/yellow]")
-            content = ""
-
-        # Cap at 8 000 chars to protect the token budget.
+        """Dispatch a task with active file/directory content injected as context."""
         cap = 8_000
-        snippet = content[:cap]
-        if len(content) > cap:
-            snippet += f"\n…[{len(content) - cap:,} chars not shown]"
+        context_lines: list[str] = []
 
-        augmented = (
-            f"[Active file: {self.active_file.resolve()}]\n"
-            f"```\n{snippet}\n```\n\n"
-            f"Task: {task}"
-        )
+        if self.active_file and self.active_file.exists():
+            try:
+                content = self.active_file.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                console.print(f"[yellow]Could not re-read active file: {exc}[/yellow]")
+                content = ""
+            snippet = content[:cap]
+            if len(content) > cap:
+                snippet += f"\n…[{len(content) - cap:,} chars not shown]"
+            context_lines.append(
+                f"[Active file: {self.active_file}]\n```\n{snippet}\n```"
+            )
+        elif self.active_dir and self.active_dir.exists():
+            # Directory session: give the model the directory listing plus
+            # content of any file mentioned in the task.
+            from pathlib import Path as _Path
+            listing = "\n".join(
+                e.name for e in sorted(self.active_dir.iterdir())
+                if not e.name.startswith(".")
+            )
+            context_lines.append(
+                f"[Active directory: {self.active_dir}]\nFiles:\n{listing}"
+            )
+            # Try to find a file mentioned by name in the task and inject it.
+            for word in task.replace(",", " ").split():
+                candidate = self.active_dir / word
+                if candidate.is_file():
+                    try:
+                        fc = candidate.read_text(encoding="utf-8", errors="replace")
+                        snippet = fc[:cap]
+                        if len(fc) > cap:
+                            snippet += f"\n…[{len(fc)-cap:,} chars not shown]"
+                        context_lines.append(
+                            f"[File content: {candidate}]\n```\n{snippet}\n```"
+                        )
+                    except OSError:
+                        pass
+                    break
+
+        augmented = "\n\n".join(context_lines) + f"\n\nTask: {task}"
         intent = classify_intent(task)
         if intent is Intent.CHAT:
             console.print("[dim]↳ intent: chat (direct model, no pipeline)[/dim]")
@@ -369,32 +435,49 @@ class OqloCLI:
                     return
         console.print("[yellow]No code block found in recent conversation.[/yellow]")
 
-    # --- /file — show / clear active file session ------------------------- #
+    # --- /file — show / clear active session ------------------------------ #
     async def cmd_file(self, args: list[str]) -> None:
         sub = args[0].lower() if args else "show"
         if sub == "clear":
             self.active_file = None
-            console.print("[green]File session cleared.[/green]")
-        elif sub == "show" or not args:
-            if not self.active_file:
-                console.print(
-                    "[dim]No active file. "
-                    "Use /start <filename> [task] to begin.[/dim]"
-                )
-            else:
+            self.active_dir = None
+            console.print("[green]Session cleared.[/green]")
+        elif sub in ("show", "status") or not args:
+            if self.active_file:
                 try:
                     content = self.active_file.read_text(
                         encoding="utf-8", errors="replace"
                     )
                     lines = content.splitlines()
                     console.print(Panel(
-                        f"[bold]{self.active_file.resolve()}[/]\n"
+                        f"[bold]{self.active_file}[/]\n"
                         f"[dim]{len(lines)} lines · {len(content):,} chars[/dim]",
                         title="📄 Active File",
                         border_style="magenta", box=box.ROUNDED,
                     ))
                 except OSError as exc:
                     console.print(f"[red]{exc}[/red]")
+            elif self.active_dir:
+                entries = sorted(self.active_dir.iterdir(),
+                                 key=lambda p: (p.is_dir(), p.name))
+                names = [
+                    ("[blue]" + e.name + "/[/]" if e.is_dir() else e.name)
+                    for e in entries[:30]
+                ]
+                console.print(Panel(
+                    f"[bold]{self.active_dir}[/]\n\n"
+                    + "  ".join(names)
+                    + (f"\n[dim]…and {len(entries)-30} more[/]"
+                       if len(entries) > 30 else ""),
+                    title="📁 Active Directory",
+                    border_style="magenta", box=box.ROUNDED,
+                ))
+            else:
+                console.print(
+                    "[dim]No active session. "
+                    "Use /start /full/path/to/file.py  or  "
+                    "/start /full/path/to/directory[/dim]"
+                )
         else:
             console.print("[red]Usage: /file show|clear[/red]")
 
@@ -1072,9 +1155,14 @@ class OqloCLI:
         )
         while self.running:
             try:
-                # Show active filename in the prompt when a file session is open.
-                fname = f":{self.active_file.name}" if self.active_file else ""
-                line = (await _ainput(f"\n[oqlo{fname}] › ")).strip()
+                # Show active path in the prompt when a session is open.
+                if self.active_file:
+                    ctx = f":{self.active_file.name}"
+                elif self.active_dir:
+                    ctx = f":{self.active_dir.name}/"
+                else:
+                    ctx = ""
+                line = (await _ainput(f"\n[oqlo{ctx}] › ")).strip()
             except (EOFError, KeyboardInterrupt):
                 break
             if not line:
