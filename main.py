@@ -85,6 +85,8 @@ class OqloCLI:
         self.verbose = True
         self.running = True
         self._last_events: list[str] = []
+        # Active file editing session (/start <file> sets this).
+        self.active_file: "Path | None" = None
         self.commands: dict[str, Callable[[list[str]], Awaitable[None]]] = {
             "start": self.cmd_start,
             "help": self.cmd_help,
@@ -117,6 +119,8 @@ class OqloCLI:
             "addon": self.cmd_addon,
             "config": self.cmd_config,
             "verbose": self.cmd_verbose,
+            "write": self.cmd_write,
+            "file": self.cmd_file,
             "quit": self.cmd_quit,
             "exit": self.cmd_quit,
         }
@@ -225,6 +229,16 @@ class OqloCLI:
                 ("just type a question", "Chat goes straight to the model — no pipeline."),
                 ("just type an instruction", "Actionable work spins up the agent pipeline."),
             ],
+            "File editing session": [
+                ("/start <file> [task]",
+                 "Open a file session — subsequent plain messages work on "
+                 "this file automatically. E.g. /start app.py add logging"),
+                ("/start clear", "Close the file session."),
+                ("/write [file]",
+                 "Write the last code block from the conversation to the "
+                 "active file (or a specific file)."),
+                ("/file show|clear", "Show or clear the active file session."),
+            ],
             "Bridges (terminal-only — never launches apps)": [
                 ("/tools", "LLM-accessible bridge tools."),
                 ("/blender <bpy>", "Run a bpy snippet directly via the bridge."),
@@ -252,12 +266,137 @@ class OqloCLI:
             "[dim]Any line without a leading '/' is sent to the orchestrator.[/dim]"
         )
 
-    # --- start / banner --------------------------------------------------- #
-    async def cmd_start(self, _: list[str]) -> None:
-        console.print(Text(BANNER, style="bold magenta"))
-        console.print(f"[magenta]{SUBTITLE}[/magenta]\n")
-        await self.cmd_status([])
-        console.print("\n[dim]Type /help for all commands.[/dim]")
+    # --- start / banner / file session ------------------------------------ #
+    async def cmd_start(self, args: list[str]) -> None:
+        # /start  OR  /start oqlocode  → show banner + status (existing behaviour)
+        if not args or args[0].lower() == "oqlocode":
+            console.print(Text(BANNER, style="bold magenta"))
+            console.print(f"[magenta]{SUBTITLE}[/magenta]\n")
+            await self.cmd_status([])
+            console.print("\n[dim]Type /help for all commands.[/dim]")
+            return
+
+        # /start clear → close active file session
+        if args[0].lower() == "clear":
+            self.active_file = None
+            console.print("[green]File session cleared.[/green]")
+            return
+
+        # /start <filepath> [initial task...] → open a file editing session
+        from pathlib import Path as _Path
+        filepath = _Path(args[0]).expanduser()
+        task = " ".join(args[1:])
+
+        if not filepath.exists():
+            console.print(f"[red]File not found: {filepath}[/red]")
+            console.print(
+                "[dim]Tip: create the file first, then /start it. "
+                "Or use an absolute path.[/dim]"
+            )
+            return
+
+        try:
+            content = filepath.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            console.print(f"[red]Cannot read {filepath}: {exc}[/red]")
+            return
+
+        self.active_file = filepath
+        lines = content.splitlines()
+        console.print(Panel(
+            f"[bold cyan]{filepath.resolve()}[/]\n"
+            f"[dim]{len(lines)} lines · {len(content):,} chars[/dim]\n\n"
+            "Now just type your instructions — no need to mention the file again.\n"
+            "[dim]/start clear  to end the session · /write to save the last code block[/dim]",
+            title="📄 File Session Started",
+            border_style="magenta", box=box.ROUNDED,
+        ))
+
+        if task:
+            await self._dispatch_with_file(task)
+
+    async def _dispatch_with_file(self, task: str) -> None:
+        """Dispatch a task with the active file's current content injected."""
+        if not self.active_file:
+            return
+        try:
+            content = self.active_file.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            console.print(f"[yellow]Could not re-read active file: {exc}[/yellow]")
+            content = ""
+
+        # Cap at 8 000 chars to protect the token budget.
+        cap = 8_000
+        snippet = content[:cap]
+        if len(content) > cap:
+            snippet += f"\n…[{len(content) - cap:,} chars not shown]"
+
+        augmented = (
+            f"[Active file: {self.active_file.resolve()}]\n"
+            f"```\n{snippet}\n```\n\n"
+            f"Task: {task}"
+        )
+        intent = classify_intent(task)
+        if intent is Intent.CHAT:
+            console.print("[dim]↳ intent: chat (direct model, no pipeline)[/dim]")
+            await self._chat(augmented)
+        else:
+            console.print("[dim]↳ intent: agentic (multi-agent pipeline)[/dim]")
+            await self._agentic(augmented)
+
+    # --- /write — apply last code block to active file -------------------- #
+    async def cmd_write(self, args: list[str]) -> None:
+        """Write the last code block from the conversation to the active file."""
+        import re
+        from pathlib import Path as _Path
+        target = _Path(args[0]).expanduser() if args else self.active_file
+        if not target:
+            console.print(
+                "[red]No active file. Use /start <filename> first, "
+                "or /write <filename>.[/red]"
+            )
+            return
+        for m in reversed(self.conv.messages):
+            if m.role == "assistant" and m.text:
+                blocks = re.findall(r"```(?:\w+)?\n([\s\S]*?)```", m.text)
+                if blocks:
+                    largest = max(blocks, key=len)
+                    target.write_text(largest, encoding="utf-8")
+                    console.print(
+                        f"[green]✓ Written to {target} "
+                        f"({len(largest.splitlines())} lines).[/green]"
+                    )
+                    return
+        console.print("[yellow]No code block found in recent conversation.[/yellow]")
+
+    # --- /file — show / clear active file session ------------------------- #
+    async def cmd_file(self, args: list[str]) -> None:
+        sub = args[0].lower() if args else "show"
+        if sub == "clear":
+            self.active_file = None
+            console.print("[green]File session cleared.[/green]")
+        elif sub == "show" or not args:
+            if not self.active_file:
+                console.print(
+                    "[dim]No active file. "
+                    "Use /start <filename> [task] to begin.[/dim]"
+                )
+            else:
+                try:
+                    content = self.active_file.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    lines = content.splitlines()
+                    console.print(Panel(
+                        f"[bold]{self.active_file.resolve()}[/]\n"
+                        f"[dim]{len(lines)} lines · {len(content):,} chars[/dim]",
+                        title="📄 Active File",
+                        border_style="magenta", box=box.ROUNDED,
+                    ))
+                except OSError as exc:
+                    console.print(f"[red]{exc}[/red]")
+        else:
+            console.print("[red]Usage: /file show|clear[/red]")
 
     # --- API key binding -------------------------------------------------- #
     def _rebuild_chain(self) -> None:
@@ -908,6 +1047,11 @@ class OqloCLI:
             await handler(args)
             return
 
+        # When a file session is active, auto-inject file content as context.
+        if self.active_file:
+            await self._dispatch_with_file(line)
+            return
+
         # Module 1: hybrid intent routing for plain text.
         if not self.auto_intent:
             await self._agentic(line)
@@ -928,7 +1072,9 @@ class OqloCLI:
         )
         while self.running:
             try:
-                line = (await _ainput("\n[oqlo] › ")).strip()
+                # Show active filename in the prompt when a file session is open.
+                fname = f":{self.active_file.name}" if self.active_file else ""
+                line = (await _ainput(f"\n[oqlo{fname}] › ")).strip()
             except (EOFError, KeyboardInterrupt):
                 break
             if not line:
