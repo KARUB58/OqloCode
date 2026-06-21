@@ -46,13 +46,17 @@ except Exception:  # pragma: no cover
 
 console = Console()
 
+# Big, bold ASCII wordmark. Rendered in purple (magenta) at startup.
 BANNER = r"""
-  ___       _        ___          _
- / _ \ __ _| |___   / __|___  __| |___
-| (_) / _` | / _ \ | (__/ _ \/ _` / -_)
- \___/\__, |_\___/  \___\___/\__,_\___|
-      |_|   the agentic OS orchestrator
+  ██████╗  ██████╗ ██╗      ██████╗      ██████╗ ██████╗ ██████╗ ███████╗
+ ██╔═══██╗██╔═══██╗██║     ██╔═══██╗    ██╔════╝██╔═══██╗██╔══██╗██╔════╝
+ ██║   ██║██║   ██║██║     ██║   ██║    ██║     ██║   ██║██║  ██║█████╗
+ ██║   ██║██║▄▄ ██║██║     ██║   ██║    ██║     ██║   ██║██║  ██║██╔══╝
+ ╚██████╔╝╚██████╔╝███████╗╚██████╔╝    ╚██████╗╚██████╔╝██████╔╝███████╗
+  ╚═════╝  ╚══▀▀═╝ ╚══════╝ ╚═════╝      ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
 """
+
+SUBTITLE = "        ⟪ The Agentic OS Orchestrator ⟫   ·   terminal-only   ·   BYOK"
 
 
 class OqloCLI:
@@ -71,12 +75,17 @@ class OqloCLI:
         self.running = True
         self._last_events: list[str] = []
         self.commands: dict[str, Callable[[list[str]], Awaitable[None]]] = {
+            "start": self.cmd_start,
             "help": self.cmd_help,
+            "api": self.cmd_api,
+            "local": self.cmd_local,
             "models": self.cmd_models,
             "chain": self.cmd_chain,
             "policy": self.cmd_policy,
             "providers": self.cmd_providers,
             "cost": self.cmd_cost,
+            "tokensave": self.cmd_tokensave,
+            "plan": self.cmd_plan,
             "tools": self.cmd_tools,
             "status": self.cmd_status,
             "history": self.cmd_history,
@@ -129,7 +138,10 @@ class OqloCLI:
     # Orchestration step hook
     # ------------------------------------------------------------------ #
     def _on_step(self, rec: StepRecord) -> None:
-        if rec.kind == "assistant" and rec.text:
+        if rec.kind == "plan" and rec.text:
+            console.print(Panel(rec.text, title="🗺️  plan (token-saver)",
+                                border_style="magenta", box=box.ROUNDED))
+        elif rec.kind == "assistant" and rec.text:
             console.print(Panel(rec.text, title=f"🧠 {rec.model}",
                                 border_style="cyan", box=box.ROUNDED))
         elif rec.kind == "tool":
@@ -152,35 +164,162 @@ class OqloCLI:
                   header_style="bold cyan")
         t.add_column("Command")
         t.add_column("Description")
-        rows = [
-            ("/help", "Show this command reference."),
-            ("/status", "Active model, policy, and bridge reachability."),
-            ("/models", "Model catalogue with cost & availability."),
-            ("/chain", "Current ordered fallback chain."),
-            ("/policy [name]", "Show or set routing policy (max_intelligence / cost_optimization)."),
-            ("/providers", "BYOK key status per provider."),
-            ("/cost", "Session token usage & USD spend."),
-            ("/tools", "LLM-accessible bridge tools."),
-            ("/history", "Show the conversation buffer."),
-            ("/save <file>", "Save conversation to JSON."),
-            ("/load <file>", "Load conversation from JSON."),
-            ("/clear  •  /reset", "Reset the conversation buffer."),
-            ("/export", "List exported FBX artifacts."),
-            ("/blender <bpy>", "Run a bpy snippet directly via the bridge."),
-            ("/unity logs [sev]", "Fetch Unity editor logs."),
-            ("/cursor open <path>", "Open a folder in Cursor."),
-            ("/skill ...", "Manage user skills (list/search/run/add/remove/reload/examples)."),
-            ("/addon <blender|unity>", "Print the in-app bridge addon/script."),
-            ("/config", "Show resolved configuration."),
-            ("/verbose <on|off>", "Toggle router/step detail."),
-            ("/quit  •  /exit", "Leave Oqlo Code."),
-        ]
-        for c, d in rows:
-            t.add_row(c, d)
+        sections = {
+            "Getting started": [
+                ("/start oqlocode", "Show the banner and full system status."),
+                ("/help", "Show this command reference."),
+                ("/status", "Active model, policy, bridges, token settings."),
+            ],
+            "Providers & routing (priority: 1.antigravity 2.cursor 3.codex 4.api)": [
+                ("/api list", "Show API key status for every cloud provider."),
+                ("/api <provider> <key>", "Bind a key live, e.g. /api openrouter sk-..."),
+                ("/api <provider> clear", "Remove a bound key."),
+                ("/local list", "Show local executive activation state."),
+                ("/local <antigravity|cursor> on|off", "Activate/deactivate a local agent."),
+                ("/providers", "BYOK status per provider."),
+                ("/models", "Model catalogue with cost & availability."),
+                ("/chain", "Current ordered fallback chain."),
+                ("/policy [name]", "local_first / max_intelligence / cost_optimization."),
+            ],
+            "Token saving": [
+                ("/tokensave on|off", "Toggle aggressive trimming + lower output caps."),
+                ("/plan on|off", "Toggle the cheap planning pass before execution."),
+                ("/cost", "Session token usage & USD spend."),
+            ],
+            "Bridges (terminal-only — never launches apps)": [
+                ("/tools", "LLM-accessible bridge tools."),
+                ("/blender <bpy>", "Run a bpy snippet directly via the bridge."),
+                ("/unity logs [sev]", "Fetch Unity editor logs."),
+                ("/cursor open <path>", "Set workspace path (reported, not opened)."),
+                ("/addon <blender|unity>", "Print the in-app bridge addon/script."),
+                ("/export", "List exported FBX artifacts."),
+            ],
+            "Skills & session": [
+                ("/skill ...", "list/search/run/add/remove/reload/examples."),
+                ("/history", "Show the conversation buffer."),
+                ("/save <file>  •  /load <file>", "Persist / restore a session."),
+                ("/clear  •  /reset", "Reset the conversation buffer."),
+                ("/config", "Show resolved configuration."),
+                ("/verbose <on|off>", "Toggle router/step detail."),
+                ("/quit  •  /exit", "Leave Oqlo Code."),
+            ],
+        }
+        for section, rows in sections.items():
+            t.add_row(f"[bold magenta]{section}[/]", "")
+            for c, d in rows:
+                t.add_row(c, d)
         console.print(t)
         console.print(
             "[dim]Any line without a leading '/' is sent to the orchestrator.[/dim]"
         )
+
+    # --- start / banner --------------------------------------------------- #
+    async def cmd_start(self, _: list[str]) -> None:
+        console.print(Text(BANNER, style="bold magenta"))
+        console.print(f"[magenta]{SUBTITLE}[/magenta]\n")
+        await self.cmd_status([])
+        console.print("\n[dim]Type /help for all commands.[/dim]")
+
+    # --- API key binding -------------------------------------------------- #
+    def _rebuild_chain(self) -> None:
+        self.router.chain = config.build_priority_chain(
+            self.policy, only_available=True
+        ) or [config.MODELS_BY_SLUG["codex-local"]]
+        self.router.active_model = self.router.chain[0]
+
+    async def cmd_api(self, args: list[str]) -> None:
+        if not args or args[0] == "list":
+            t = Table(title="API Providers (priority tier 4)", box=box.ROUNDED,
+                      header_style="bold cyan")
+            t.add_column("Provider")
+            t.add_column("Key")
+            t.add_column("Base URL")
+            for name, prov in (
+                ("openrouter", config.Provider.OPENROUTER),
+                ("anthropic", config.Provider.ANTHROPIC),
+                ("openai", config.Provider.OPENAI),
+                ("gemini", config.Provider.GEMINI),
+            ):
+                ep = config.ENDPOINTS[prov]
+                key = "[green]set[/]" if ep.is_configured else "[red]missing[/]"
+                t.add_row(name, key, ep.base_url)
+            console.print(t)
+            console.print("[dim]Bind with: /api <provider> <key>[/dim]")
+            return
+        name = args[0].lower()
+        prov = config.API_PROVIDER_ALIASES.get(name)
+        if prov is None:
+            console.print(f"[red]Unknown API provider '{name}'. "
+                          "Use openrouter|anthropic|openai|gemini.[/red]")
+            return
+        if len(args) < 2:
+            console.print(f"[red]Usage: /api {name} <key>  (or 'clear')[/red]")
+            return
+        if args[1] == "clear":
+            config.set_runtime_key(prov, None)
+            console.print(f"[green]Cleared {name} key.[/green]")
+        else:
+            key = args[1]
+            config.set_runtime_key(prov, key)
+            masked = key[:6] + "…" + key[-4:] if len(key) > 12 else "••••"
+            console.print(f"[green]Bound {name} key ({masked}).[/green]")
+        self._rebuild_chain()
+        await self.cmd_chain([])
+
+    # --- local executive activation -------------------------------------- #
+    async def cmd_local(self, args: list[str]) -> None:
+        locals_ = {
+            "antigravity": config.Provider.ANTIGRAVITY,
+            "cursor": config.Provider.CURSOR,
+            "codex": config.Provider.CODEX,
+        }
+        if not args or args[0] == "list":
+            t = Table(title="Local Executives (priority 1-3)", box=box.ROUNDED,
+                      header_style="bold cyan")
+            t.add_column("Agent")
+            t.add_column("Priority")
+            t.add_column("Active")
+            for name, prov in locals_.items():
+                rank = config.MODELS_BY_SLUG[
+                    {"antigravity": "antigravity-agent",
+                     "cursor": "cursor-agent",
+                     "codex": "codex-local"}[name]].priority_rank
+                state = ("[green]on[/]" if config.is_local_active(prov)
+                         else "[yellow]defer[/]")
+                t.add_row(name, str(rank), state)
+            console.print(t)
+            console.print("[dim]Codex auto-answers offline when no API key is "
+                          "set. Toggle others with /local <name> on|off[/dim]")
+            return
+        name = args[0].lower()
+        prov = locals_.get(name)
+        if prov is None or len(args) < 2 or args[1] not in ("on", "off"):
+            console.print("[red]Usage: /local <antigravity|cursor|codex> on|off[/red]")
+            return
+        config.set_local_active(prov, args[1] == "on")
+        console.print(f"[green]{name} {'activated' if args[1]=='on' else 'deactivated'}.[/green]")
+        self._rebuild_chain()
+
+    # --- token-saving toggles -------------------------------------------- #
+    async def cmd_tokensave(self, args: list[str]) -> None:
+        b = config.TOKEN_BUDGET
+        if args and args[0] in ("on", "off"):
+            b.saver_mode = args[0] == "on"
+        t = Table(title="Token Saver", box=box.ROUNDED, header_style="bold cyan")
+        t.add_column("Setting")
+        t.add_column("Value", justify="right")
+        t.add_row("Saver mode", "[green]on[/]" if b.saver_mode else "[red]off[/]")
+        t.add_row("Output cap (saver)", str(b.saver_output_tokens))
+        t.add_row("History window (msgs)", str(b.max_history_messages))
+        t.add_row("Tool result cap (chars)", str(b.max_tool_chars))
+        t.add_row("Plan-first", "[green]on[/]" if b.plan_first else "[red]off[/]")
+        console.print(t)
+
+    async def cmd_plan(self, args: list[str]) -> None:
+        b = config.TOKEN_BUDGET
+        if args and args[0] in ("on", "off"):
+            b.plan_first = args[0] == "on"
+        console.print(f"Plan-first: [bold]{'on' if b.plan_first else 'off'}[/]")
 
     async def cmd_models(self, _: list[str]) -> None:
         t = Table(title="Model Catalogue", box=box.ROUNDED,
@@ -214,7 +353,7 @@ class OqloCLI:
     async def cmd_policy(self, args: list[str]) -> None:
         if not args:
             console.print(f"Current policy: [bold]{self.policy.value}[/]")
-            console.print("Options: max_intelligence, cost_optimization")
+            console.print("Options: local_first, max_intelligence, cost_optimization")
             return
         try:
             self.policy = config.RoutingPolicy(args[0])
@@ -223,7 +362,7 @@ class OqloCLI:
             return
         self.router.chain = config.build_priority_chain(
             self.policy, only_available=True
-        ) or [config.MODELS_BY_SLUG["cursor-codex"]]
+        ) or [config.MODELS_BY_SLUG["codex-local"]]
         console.print(f"[green]Policy set to {self.policy.value}.[/green] "
                       "Re-run /chain to see the new order.")
 
@@ -267,9 +406,16 @@ class OqloCLI:
         t = Table(title="Oqlo Status", box=box.ROUNDED, header_style="bold cyan")
         t.add_column("Subsystem")
         t.add_column("State")
+        b = config.TOKEN_BUDGET
+        api_on = "[green]yes[/]" if config.any_api_key_configured() else "[red]no[/]"
         t.add_row("Routing policy", self.policy.value)
+        t.add_row("Priority", "1.antigravity → 2.cursor → 3.codex → 4.api")
         t.add_row("Active model", self.router.active_model.name)
         t.add_row("Chain length", str(len(self.router.chain)))
+        t.add_row("API key configured", api_on)
+        t.add_row("Mode", "terminal-only (never launches apps)")
+        t.add_row("Token saver", "[green]on[/]" if b.saver_mode else "[red]off[/]")
+        t.add_row("Plan-first", "[green]on[/]" if b.plan_first else "[red]off[/]")
         t.add_row("Blender bridge",
                   "[green]live[/]" if blender_ok else "[yellow]offline (simulated)[/]")
         t.add_row("Unity bridge",
@@ -520,12 +666,11 @@ class OqloCLI:
                 console.print(f"[red]Orchestration error: {exc}[/red]")
 
     async def repl(self) -> None:
-        console.print(Text(BANNER, style="bold magenta"))
+        await self.cmd_start([])
         console.print(
-            "[dim]Type /help for commands. Plain text runs the orchestrator. "
-            "Ctrl-C or /quit to exit.[/dim]\n"
+            "\n[dim]Plain text runs the orchestrator. "
+            "Type /start oqlocode anytime. Ctrl-C or /quit to exit.[/dim]"
         )
-        await self.cmd_status([])
         while self.running:
             try:
                 line = (await _ainput("\n[oqlo] › ")).strip()

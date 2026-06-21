@@ -75,26 +75,18 @@ class CursorBridge:
     async def set_antigravity_model_preset(
         self, preset: str, open_workspace: str | None = None
     ) -> ToolResult:
+        # Terminal-only mode: Oqlo never launches a GUI application. We record
+        # the preset and resolve/validate the workspace path, reporting it as
+        # text instead of spawning the Cursor window.
         self.preset = preset
-        opened = "none"
+        workspace = "none"
         if open_workspace:
             ws = Path(open_workspace).expanduser()
-            cursor_cli = shutil.which("cursor")
-            if cursor_cli:
-                proc = await asyncio.create_subprocess_exec(
-                    cursor_cli, str(ws),
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await proc.communicate()
-                opened = str(ws)
-            else:
-                # No CLI: record the intent; the workspace path is still valid.
-                opened = f"{ws} (cursor CLI not found)"
+            exists = "exists" if ws.exists() else "missing"
+            workspace = f"{ws} ({exists}) — not opened (terminal-only mode)"
         return ToolResult(
             ok=True,
             tool="set_antigravity_model_preset",
-            summary=f"Antigravity preset set to '{preset}'.",
-            data={"preset": preset, "workspace": opened},
-            simulated=shutil.which("cursor") is None and open_workspace is not None,
+            summary=f"Antigravity preset set to '{preset}' (terminal-only).",
+            data={"preset": preset, "workspace": workspace},
         )

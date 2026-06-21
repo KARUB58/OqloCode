@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import config
-from config import ModelProfile, Provider
+from config import ModelProfile, Provider, TOKEN_BUDGET
 from tools_manifest import tools_for_dialect
 
 try:
@@ -109,6 +109,39 @@ class Conversation:
         self.messages.append(
             Message(role="user", text=f"[SYSTEM ERROR: {traceback}]")
         )
+
+
+def trim_for_send(conv: Conversation) -> Conversation:
+    """Return a token-budgeted shallow copy of ``conv`` for upstream sending.
+
+    Token-saving measure #1: cap the number of trailing messages and truncate
+    bulky tool results. The original buffer is never mutated, so full state is
+    preserved for fallback and persistence; only the *wire payload* shrinks.
+
+    Care is taken not to orphan a ``tool`` message from the ``assistant`` turn
+    that requested it, which providers reject.
+    """
+    budget = TOKEN_BUDGET
+    msgs = conv.messages
+    keep_n = max(2, budget.max_history_messages)
+    window = msgs[-keep_n:] if len(msgs) > keep_n else list(msgs)
+
+    # Don't lead the window with an orphan tool result.
+    while window and window[0].role == "tool":
+        window = window[1:]
+
+    trimmed = Conversation(conv.system_prompt)
+    cap = budget.max_tool_chars
+    for m in window:
+        if m.role == "tool" and len(m.text) > cap:
+            clipped = m.text[:cap] + f"\n…[truncated {len(m.text) - cap} chars]"
+            trimmed.messages.append(
+                Message(role="tool", text=clipped,
+                        tool_call_id=m.tool_call_id, tool_name=m.tool_name)
+            )
+        else:
+            trimmed.messages.append(m)
+    return trimmed
 
 
 # --------------------------------------------------------------------------- #
@@ -249,23 +282,50 @@ class LLMRouter:
     ) -> None:
         self.chain = chain or config.build_priority_chain(only_available=True)
         if not self.chain:
-            # Nothing has a key — fall back to the local cursor stub only.
-            self.chain = [config.MODELS_BY_SLUG["cursor-codex"]]
+            # Local executives are always selectable; Codex is the safety net.
+            self.chain = [config.MODELS_BY_SLUG["codex-local"]]
         self.on_event = on_event or (lambda *_: None)
         self.max_retries_per_model = max_retries_per_model
         self.session_usage = Usage()
         self.session_cost_usd: float = 0.0
         self.active_model: ModelProfile = self.chain[0]
+        # When set, caps output tokens for the next call(s) — used by plan().
+        self._output_override: int | None = None
         self._client: Any = (
             httpx.AsyncClient(timeout=httpx.Timeout(60.0)) if httpx else None
         )
+
+    def _effective_output(self, model: ModelProfile) -> int:
+        if self._output_override is not None:
+            return min(model.max_output_tokens, self._output_override)
+        return TOKEN_BUDGET.effective_output_tokens(model.max_output_tokens)
+
+    async def plan(self, user_input: str) -> str:
+        """Token-saving measure #2: a cheap, capped planning pass.
+
+        Produces a short numbered tool plan on a throwaway buffer with output
+        hard-capped at ``plan_max_tokens``. A focused plan reduces wandering in
+        the (more expensive) execution loop, so the overall run costs less.
+        Best-effort: any failure returns an empty string and execution proceeds.
+        """
+        scratch = Conversation(config.SYSTEM_PROMPT)
+        scratch.user(f"{user_input}\n\n{config.PLAN_PROMPT}")
+        prev = self._output_override
+        self._output_override = TOKEN_BUDGET.plan_max_tokens
+        try:
+            resp = await self.complete(scratch)
+            return resp.text.strip()
+        except Exception:  # noqa: BLE001 - planning is optional.
+            return ""
+        finally:
+            self._output_override = prev
 
     # --- public API ------------------------------------------------------- #
     async def complete(self, conv: Conversation) -> LLMResponse:
         """Run one turn, walking the fallback chain until one provider answers."""
         last_error: Exception | None = None
         for model in self.chain:
-            if not model.is_available and model.provider is not Provider.CURSOR:
+            if not model.is_available:
                 self._emit("skip", model=model.name, reason="no credentials")
                 continue
             for attempt in range(1, self.max_retries_per_model + 1):
@@ -317,12 +377,12 @@ class LLMRouter:
 
     # --- dispatch --------------------------------------------------------- #
     async def _dispatch(self, model: ModelProfile, conv: Conversation) -> LLMResponse:
+        if model.provider.is_local:
+            return self._call_local(model, conv)
         if model.provider is Provider.ANTHROPIC:
             return await self._call_anthropic(model, conv)
         if model.provider is Provider.GEMINI:
             return await self._call_gemini(model, conv)
-        if model.provider is Provider.CURSOR:
-            return self._call_cursor(model, conv)
         # OpenAI + OpenRouter share the chat-completions dialect.
         return await self._call_openai_compatible(model, conv)
 
@@ -340,10 +400,10 @@ class LLMRouter:
         headers = {"Authorization": f"Bearer {ep.api_key}", **ep.extra_headers}
         body = {
             "model": model.slug,
-            "messages": to_openai_messages(conv),
+            "messages": to_openai_messages(trim_for_send(conv)),
             "tools": tools_for_dialect("openai"),
             "tool_choice": "auto",
-            "max_tokens": model.max_output_tokens,
+            "max_tokens": self._effective_output(model),
         }
         data = await self._post_json(client, f"{ep.base_url}/chat/completions",
                                      headers, body)
@@ -369,9 +429,9 @@ class LLMRouter:
         body = {
             "model": model.slug,
             "system": conv.system_prompt,
-            "messages": to_anthropic_messages(conv),
+            "messages": to_anthropic_messages(trim_for_send(conv)),
             "tools": tools_for_dialect("anthropic"),
-            "max_tokens": model.max_output_tokens,
+            "max_tokens": self._effective_output(model),
         }
         data = await self._post_json(client, f"{ep.base_url}/messages",
                                      headers, body)
@@ -410,9 +470,11 @@ class LLMRouter:
         ]
         body = {
             "system_instruction": {"parts": [{"text": conv.system_prompt}]},
-            "contents": to_gemini_contents(conv),
+            "contents": to_gemini_contents(trim_for_send(conv)),
             "tools": [{"function_declarations": decls}],
-            "generationConfig": {"maxOutputTokens": model.max_output_tokens},
+            "generationConfig": {
+                "maxOutputTokens": self._effective_output(model)
+            },
         }
         data = await self._post_json(client, url, {}, body)
         text_parts: list[str] = []
@@ -438,21 +500,42 @@ class LLMRouter:
         )
         return self._finish(model, "".join(text_parts), tool_calls, usage)
 
-    # --- Cursor (local terminal fallback) -------------------------------- #
-    def _call_cursor(self, model: ModelProfile, conv: Conversation) -> LLMResponse:
-        """Terminal fallback. No network: returns a plain-text acknowledgement.
+    # --- Local executives (Antigravity / Cursor / Codex) ----------------- #
+    def _call_local(self, model: ModelProfile, conv: Conversation) -> LLMResponse:
+        """Handle a priority 1-3 local provider — zero token cost, no network.
 
-        This guarantees the loop always resolves even with zero connectivity,
-        so the user is never left with a hard crash.
+        * Antigravity & Cursor: only respond when explicitly activated by the
+          operator (they assume a real local IDE agent is wired in). Otherwise
+          they *defer* — raising a fallback so the next tier is tried.
+        * Codex: the offline safety net. It defers whenever any cloud API key
+          is configured (so the API tier does the real tool work), but answers
+          locally when there is no API at all, guaranteeing the loop resolves
+          even fully offline instead of crashing.
         """
+        provider = model.provider
+        if provider in (Provider.ANTIGRAVITY, Provider.CURSOR):
+            if not config.is_local_active(provider):
+                raise ProviderError(
+                    0, f"{model.name} inactive — deferring "
+                       f"(enable with /local {provider.value} on)")
+            return self._local_plan_response(model, conv)
+
+        # Codex
+        if config.any_api_key_configured() and not config.is_local_active(provider):
+            raise ProviderError(0, "Codex deferring to configured API tier")
+        return self._local_plan_response(model, conv)
+
+    def _local_plan_response(
+        self, model: ModelProfile, conv: Conversation
+    ) -> LLMResponse:
         last_user = next(
-            (m.text for m in reversed(conv.messages) if m.role == "user"),
-            "",
-        )
+            (m.text for m in reversed(conv.messages) if m.role == "user"), "")
         text = (
-            "[Cursor Codex local fallback] No cloud provider was reachable. "
-            "I can't execute tools without a model, but here is the captured "
-            f"request so no state is lost:\n{last_user[:500]}"
+            f"[{model.name}] Operating offline with no cloud model, so I cannot "
+            "emit tool calls — but no state is lost. Captured request:\n"
+            f"{last_user[:400]}\n\n"
+            "Add an API key to execute the pipeline, e.g. "
+            "/api openrouter <key>."
         )
         return self._finish(model, text, [], Usage())
 

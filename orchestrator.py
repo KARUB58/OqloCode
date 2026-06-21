@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import config
 from bridges import BridgeRouter, ToolResult
 from llm_router import Conversation, LLMResponse, LLMRouter, ToolCall
 
@@ -59,9 +60,21 @@ class Orchestrator:
 
     async def run(self, user_input: str) -> str:
         """Process one compound user request; return the final assistant text."""
-        self.conv.user(user_input)
         self._heal_counts.clear()
         final_text = ""
+
+        # Token-saving: draft a cheap, capped plan first so the execution loop
+        # stays focused (fewer iterations -> fewer tokens).
+        if config.TOKEN_BUDGET.plan_first:
+            plan = await self.router.plan(user_input)
+            if plan and not plan.startswith("["):  # skip local "offline" stubs.
+                self._emit(StepRecord(kind="plan", text=plan,
+                                      model=self.router.active_model.name))
+                user_input = (
+                    f"{user_input}\n\n[Approved plan — follow it concisely]\n{plan}"
+                )
+
+        self.conv.user(user_input)
 
         for _ in range(self.max_steps):
             response: LLMResponse = await self.router.complete(self.conv)
