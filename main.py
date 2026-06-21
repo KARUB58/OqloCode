@@ -36,6 +36,7 @@ from ast_memory import ASTMemory
 from telemetry import Telemetry, TelemetryThrottler
 from swarm_bus import SwarmCoordinator
 from intent import Intent, classify_intent
+from workspace import WorkspaceManager, CrossTask
 
 try:
     from rich.console import Console
@@ -88,6 +89,8 @@ class OqloCLI:
         # Active file/directory session (/start <path> sets one of these).
         self.active_file: "Path | None" = None
         self.active_dir: "Path | None" = None  # directory workspace
+        # Multi-project workspace module.
+        self.wm = WorkspaceManager()
         self.commands: dict[str, Callable[[list[str]], Awaitable[None]]] = {
             "start": self.cmd_start,
             "help": self.cmd_help,
@@ -122,6 +125,8 @@ class OqloCLI:
             "verbose": self.cmd_verbose,
             "write": self.cmd_write,
             "file": self.cmd_file,
+            "workspace": self.cmd_workspace,
+            "ws": self.cmd_workspace,
             "quit": self.cmd_quit,
             "exit": self.cmd_quit,
         }
@@ -229,6 +234,29 @@ class OqloCLI:
             "Hybrid chat (plain text auto-routes)": [
                 ("just type a question", "Chat goes straight to the model — no pipeline."),
                 ("just type an instruction", "Actionable work spins up the agent pipeline."),
+            ],
+            "Multi-project workspaces (/ws alias works too)": [
+                ("/workspace add <name> <path> [type]",
+                 "Register a workspace root (Blender|Unity|Cursor|Generic). "
+                 "E.g. /workspace add server /home/user/api Generic"),
+                ("/workspace list", "Show all registered workspaces."),
+                ("/workspace switch <name>", "Set the active workspace context."),
+                ("/workspace remove <name>", "Unregister a workspace."),
+                ("/workspace index [name|all]",
+                 "Walk Python files, extract AST symbols, detect cross-workspace "
+                 "dependencies. Flags stale symbols when a hash changes."),
+                ("/workspace symbols [ws] [term]",
+                 "Search the cross-workspace symbol registry."),
+                ("/workspace stale",
+                 "Show symbols flagged stale by a cross-workspace hash change."),
+                ("/workspace deps",
+                 "List all detected cross-workspace dependency links."),
+                ("/workspace resolve [ws]:path",
+                 "Resolve a VFFS path expression to an absolute path."),
+                ("/workspace sync ws:task [ws:task ...]",
+                 "Run a cross-project pipeline with dependency locking. "
+                 "E.g. /workspace sync server:compile client:types client:tests"),
+                ("/workspace status", "Full workspace + symbol registry overview."),
             ],
             "File / directory session (enter full path)": [
                 ("/start /path/to/file.py [task]",
@@ -480,6 +508,253 @@ class OqloCLI:
                 )
         else:
             console.print("[red]Usage: /file show|clear[/red]")
+
+    # ------------------------------------------------------------------ #
+    # /workspace — multi-project workspace module
+    # ------------------------------------------------------------------ #
+    async def cmd_workspace(self, args: list[str]) -> None:  # noqa: C901
+        """Virtual Federated File System + cross-boundary symbol resolver."""
+        sub = args[0].lower() if args else "list"
+
+        # ── /workspace list ──────────────────────────────────────────────
+        if sub == "list":
+            ws_list = self.wm.vffs.all()
+            if not ws_list:
+                console.print(
+                    "[dim]No workspaces registered. "
+                    "Use /workspace add <name> <path> [type][/dim]"
+                )
+                return
+            t = Table(title="Registered Workspaces (VFFS)",
+                      box=box.ROUNDED, header_style="bold cyan")
+            t.add_column("Name")
+            t.add_column("Root Path")
+            t.add_column("Type")
+            t.add_column("AST")
+            t.add_column("Active")
+            active = self.wm.state.active_workspace_context
+            for ws in ws_list:
+                t.add_row(
+                    ws.name,
+                    str(ws.root),
+                    ws.environment_type,
+                    "[green]on[/]" if ws.ast_enabled else "[red]off[/]",
+                    "[green]◀[/]" if ws.name == active else "",
+                )
+            console.print(t)
+            stale = self.wm.symbols.stale_symbols()
+            if stale:
+                console.print(
+                    f"[yellow]⚠ {len(stale)} stale cross-workspace symbol(s). "
+                    "Run /workspace index to refresh.[/yellow]"
+                )
+
+        # ── /workspace add <name> <path> [type] ─────────────────────────
+        elif sub == "add":
+            if len(args) < 3:
+                console.print(
+                    "[red]Usage: /workspace add <name> <path> "
+                    "[Blender|Unity|Cursor|Generic][/red]"
+                )
+                return
+            name, raw_path = args[1], args[2]
+            env_type = args[3].capitalize() if len(args) > 3 else "Generic"
+            from pathlib import Path as _P
+            root = _P(raw_path.replace("\\", "/")).expanduser().resolve()
+            if not root.exists():
+                console.print(f"[red]Path does not exist: {root}[/red]")
+                return
+            profile = self.wm.add_workspace(name, str(root), env_type)
+            console.print(Panel(
+                f"[bold cyan]{profile.name}[/]  →  {profile.root}\n"
+                f"Type: {profile.environment_type}  ·  "
+                f"AST indexing: {'enabled' if profile.ast_enabled else 'disabled'}",
+                title="✅ Workspace Registered",
+                border_style="green", box=box.ROUNDED,
+            ))
+
+        # ── /workspace remove <name> ─────────────────────────────────────
+        elif sub in ("remove", "rm"):
+            if len(args) < 2:
+                console.print("[red]Usage: /workspace remove <name>[/red]")
+                return
+            if self.wm.remove_workspace(args[1]):
+                console.print(f"[green]Workspace '{args[1]}' removed.[/green]")
+            else:
+                console.print(f"[red]Workspace '{args[1]}' not found.[/red]")
+
+        # ── /workspace switch <name> ─────────────────────────────────────
+        elif sub in ("switch", "use"):
+            if len(args) < 2:
+                console.print("[red]Usage: /workspace switch <name>[/red]")
+                return
+            if self.wm.switch_workspace(args[1]):
+                ws = self.wm.vffs.get(args[1])
+                console.print(
+                    f"[green]Switched to workspace '{args[1]}' "
+                    f"({ws.root if ws else '?'})[/green]"
+                )
+            else:
+                console.print(f"[red]Workspace '{args[1]}' not found.[/red]")
+
+        # ── /workspace index [name|all] ──────────────────────────────────
+        elif sub == "index":
+            name = args[1] if len(args) > 1 else None
+            if name and name != "all":
+                result = self.wm.index_workspace(name)
+                if "error" in result:
+                    console.print(f"[red]{result['error']}[/red]")
+                else:
+                    console.print(Panel(
+                        f"[bold]{result['workspace']}[/]\n"
+                        f"Files scanned: {result.get('py_files', 0)}\n"
+                        f"Symbols added: {result.get('symbols_added', 0)}\n"
+                        f"Symbols updated: {result.get('symbols_updated', 0)}\n"
+                        f"Stale flags: {result.get('stale_flags', 0)}",
+                        title="🔍 AST Index Result",
+                        border_style="cyan", box=box.ROUNDED,
+                    ))
+            else:
+                results = self.wm.index_all()
+                for r in results:
+                    if "error" in r:
+                        console.print(f"[red]{r['error']}[/red]")
+                    else:
+                        console.print(
+                            f"[green]✓ {r['workspace']}[/] "
+                            f"{r.get('py_files',0)} files · "
+                            f"+{r.get('symbols_added',0)} sym "
+                            f"~{r.get('symbols_updated',0)} upd"
+                        )
+
+        # ── /workspace symbols [name] [term] ─────────────────────────────
+        elif sub in ("symbols", "sym"):
+            ws_filter = args[1] if len(args) > 1 else None
+            term = args[2] if len(args) > 2 else ""
+            hits = self.wm.symbols.search(term, workspace=ws_filter)
+            if not hits:
+                console.print("[dim]No matching symbols.[/dim]")
+                return
+            t = Table(title="Symbol Registry", box=box.SIMPLE,
+                      header_style="bold cyan")
+            t.add_column("FQN")
+            t.add_column("Kind")
+            t.add_column("Signature")
+            for s in hits[:30]:
+                t.add_row(s.fqn, s.kind, s.signature)
+            console.print(t)
+            st = self.wm.symbols.stats()
+            console.print(
+                f"[dim]Total: {st['total_symbols']} symbols · "
+                f"{st['dependency_links']} links · "
+                f"{st['cross_workspace_links']} cross-ws · "
+                f"{st['stale_flags']} stale[/dim]"
+            )
+
+        # ── /workspace stale ─────────────────────────────────────────────
+        elif sub == "stale":
+            stale = self.wm.symbols.stale_symbols()
+            if not stale:
+                console.print("[green]No stale cross-workspace symbols.[/green]")
+                return
+            console.print(Panel(
+                "\n".join(s.fqn for s in stale),
+                title=f"⚠ {len(stale)} Stale Symbol(s)",
+                border_style="yellow", box=box.ROUNDED,
+            ))
+            console.print(
+                "[dim]These depend on symbols that changed in another workspace. "
+                "Re-run /workspace index after updating them.[/dim]"
+            )
+
+        # ── /workspace deps ──────────────────────────────────────────────
+        elif sub == "deps":
+            links = self.wm.symbols.cross_workspace_deps()
+            if not links:
+                console.print("[dim]No cross-workspace dependency links.[/dim]")
+                return
+            t = Table(title="Cross-Workspace Dependencies",
+                      box=box.SIMPLE, header_style="bold cyan")
+            t.add_column("Source")
+            t.add_column("Kind")
+            t.add_column("Target")
+            for lnk in links[:40]:
+                t.add_row(lnk.source_fqn, lnk.kind, lnk.target_fqn)
+            console.print(t)
+
+        # ── /workspace resolve <path-expr> ───────────────────────────────
+        elif sub == "resolve":
+            if len(args) < 2:
+                console.print(
+                    "[red]Usage: /workspace resolve [name]:path/to/file[/red]"
+                )
+                return
+            resolved = self.wm.resolve(" ".join(args[1:]))
+            exists = "[green]exists[/]" if resolved.exists() else "[red]not found[/]"
+            console.print(f"{resolved}  {exists}")
+
+        # ── /workspace sync — cross-project pipeline demo ────────────────
+        elif sub == "sync":
+            if len(args) < 2:
+                console.print(
+                    "[red]Usage: /workspace sync <task> [→ <dep_task>...]\n"
+                    "Example: /workspace sync server:compile client:types[/red]"
+                )
+                return
+            self.wm.sync.clear()
+            task_ids: list[str] = []
+            for spec in args[1:]:
+                ws_part, _, desc = spec.partition(":")
+                ws_part = ws_part.strip()
+                if not ws_part:
+                    ws_part = self.wm.state.active_workspace_context
+                tid = self.wm.sync.add_task(
+                    ws_part,
+                    desc.strip() or spec,
+                    depends_on=[task_ids[-1]] if task_ids else [],
+                )
+                task_ids.append(tid)
+            console.print(Panel(
+                self.wm.sync.dag_summary(),
+                title="⛓ Cross-Project Task DAG",
+                border_style="yellow", box=box.ROUNDED,
+            ))
+
+            async def _dummy_executor(task: CrossTask) -> str:
+                await asyncio.sleep(0.05)
+                return f"[simulated] {task.description} complete"
+
+            results = await self.wm.sync.run_all(
+                executor=_dummy_executor,
+                on_update=lambda t: console.print(
+                    f"  [dim]{t.workspace}[/] [{t.state}] {t.description}"
+                ),
+            )
+            done = sum(1 for t in results.values() if t.state == "done")
+            failed = sum(1 for t in results.values() if t.state == "failed")
+            color = "green" if not failed else "red"
+            console.print(Panel(
+                self.wm.sync.dag_summary(),
+                title=f"⛓ Pipeline Done — {done} ok / {failed} failed",
+                border_style=color, box=box.ROUNDED,
+            ))
+
+        # ── /workspace status ─────────────────────────────────────────────
+        elif sub == "status":
+            ctx = self.wm.context_block()
+            st = self.wm.symbols.stats()
+            body = (
+                ctx or "[dim]No workspaces registered.[/dim]"
+            ) + f"\n\n[dim]Symbol index: {st['total_symbols']} total · "
+            f"{st['cross_workspace_links']} cross-ws deps[/dim]"
+            console.print(Panel(body, title="📐 Workspace Status",
+                                border_style="magenta", box=box.ROUNDED))
+
+        else:
+            console.print(
+                "[red]Usage: /workspace <list|add|remove|switch|index|"
+                "symbols|stale|deps|resolve|sync|status>[/red]"
+            )
 
     # --- API key binding -------------------------------------------------- #
     def _rebuild_chain(self) -> None:
