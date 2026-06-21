@@ -852,12 +852,32 @@ class OqloCLI:
         try:
             resp = await self.router.chat(self.conv)
         except Exception as exc:  # noqa: BLE001 - keep the REPL alive.
-            console.print(f"[red]Chat error: {exc}[/red]")
+            # Remove the orphaned user message so the next turn is clean.
+            if self.conv.messages and self.conv.messages[-1].role == "user":
+                self.conv.messages.pop()
+            override = self.router.override_model
+            if override:
+                console.print(
+                    f"[red]✗ '{override.slug}' failed — all fallbacks exhausted.[/red]\n"
+                    f"[yellow]→ Bind a key:  /api {override.provider.value} <key>\n"
+                    "→ Or reset:    /model reset[/yellow]"
+                )
+            else:
+                console.print(f"[red]All providers exhausted: {exc}[/red]")
             return
         self.conv.assistant(resp.text, [])
-        console.print(Panel(resp.text or "[dim](no reply)[/dim]",
-                            title=f"💬 {resp.model.name}",
-                            border_style="cyan", box=box.ROUNDED))
+        if not resp.text.strip():
+            console.print(Panel(
+                "[dim]The model returned an empty response.\n"
+                "Free-tier models sometimes do this under load — try again, "
+                "or use /model reset to return to the priority chain.[/dim]",
+                title=f"💬 {resp.model.name} [yellow](empty)[/yellow]",
+                border_style="yellow", box=box.ROUNDED,
+            ))
+        else:
+            console.print(Panel(resp.text,
+                                title=f"💬 {resp.model.name}",
+                                border_style="cyan", box=box.ROUNDED))
 
     async def _agentic(self, line: str) -> None:
         orch = Orchestrator(

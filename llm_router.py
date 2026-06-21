@@ -304,8 +304,18 @@ class LLMRouter:
 
     @property
     def effective_chain(self) -> list[ModelProfile]:
-        """The chain actually used: a live override bypasses the priority chain."""
-        return [self.override_model] if self.override_model else self.chain
+        """The chain actually used: override is first, then priority chain as fallback.
+
+        A live /model override is tried first so the user's choice is honoured.
+        If that model fails (no key, network error, empty reply) the regular
+        priority chain provides an emergency safety net — Codex responds offline
+        so the loop never goes completely silent.
+        """
+        if self.override_model:
+            return [self.override_model] + [
+                m for m in self.chain if m.slug != self.override_model.slug
+            ]
+        return self.chain
 
     def set_override(self, model: ModelProfile) -> None:
         self.override_model = model
