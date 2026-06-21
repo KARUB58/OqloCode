@@ -338,6 +338,39 @@ PRIORITY_CHAIN: Final[list[ModelProfile]] = build_priority_chain(
 )
 
 
+def make_model_for_slug(slug: str) -> ModelProfile:
+    """Build a routable :class:`ModelProfile` for an arbitrary model slug.
+
+    Used by the live ``/model <slug>`` override. Known catalogue slugs are
+    returned as-is; anything else is wrapped in an ad-hoc profile with the
+    provider inferred from the slug shape:
+
+    * ``vendor/model[:tier]`` (contains '/')  -> OpenRouter (its native format)
+    * ``claude*`` / ``gpt*`` / ``gemini*``    -> the matching native provider
+    * otherwise                                -> OpenRouter
+    """
+    slug = slug.strip()
+    if slug in MODELS_BY_SLUG:
+        return MODELS_BY_SLUG[slug]
+    low = slug.lower()
+    if "/" in slug:
+        provider = Provider.OPENROUTER
+    elif "claude" in low:
+        provider = Provider.ANTHROPIC
+    elif low.startswith(("gpt", "o1", "o3", "o4", "chatgpt")):
+        provider = Provider.OPENAI
+    elif low.startswith("gemini"):
+        provider = Provider.GEMINI
+    else:
+        provider = Provider.OPENROUTER
+    return ModelProfile(
+        name=slug, slug=slug, provider=provider,
+        input_cost_per_1m=0.0, output_cost_per_1m=0.0,
+        intelligence_tier=90, fallback_tier=0, priority_rank=0,
+        max_output_tokens=4096,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Bridge endpoints
 # --------------------------------------------------------------------------- #

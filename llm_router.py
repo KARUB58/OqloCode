@@ -294,9 +294,27 @@ class LLMRouter:
         self.active_model: ModelProfile = self.chain[0]
         # When set, caps output tokens for the next call(s) — used by plan().
         self._output_override: int | None = None
+        # Module 1: live /model override — when set, the chain is bypassed.
+        self.override_model: ModelProfile | None = None
+        # When True, tools are omitted from the request (direct-chat mode).
+        self._suppress_tools: bool = False
         self._client: Any = (
             httpx.AsyncClient(timeout=httpx.Timeout(60.0)) if httpx else None
         )
+
+    @property
+    def effective_chain(self) -> list[ModelProfile]:
+        """The chain actually used: a live override bypasses the priority chain."""
+        return [self.override_model] if self.override_model else self.chain
+
+    def set_override(self, model: ModelProfile) -> None:
+        self.override_model = model
+        self.active_model = model
+
+    def clear_override(self) -> None:
+        self.override_model = None
+        if self.chain:
+            self.active_model = self.chain[0]
 
     def _effective_output(self, model: ModelProfile) -> int:
         if self._output_override is not None:
@@ -323,11 +341,24 @@ class LLMRouter:
         finally:
             self._output_override = prev
 
+    async def chat(self, conv: Conversation) -> LLMResponse:
+        """Direct conversational turn — no tools, straight model response.
+
+        Used by the INTENT_CHAT fast path so casual messages never trigger tool
+        calls or the DAG pipeline (and cost fewer tokens).
+        """
+        prev = self._suppress_tools
+        self._suppress_tools = True
+        try:
+            return await self.complete(conv)
+        finally:
+            self._suppress_tools = prev
+
     # --- public API ------------------------------------------------------- #
     async def complete(self, conv: Conversation) -> LLMResponse:
         """Run one turn, walking the fallback chain until one provider answers."""
         last_error: Exception | None = None
-        for model in self.chain:
+        for model in self.effective_chain:
             if not model.is_available:
                 self._emit("skip", model=model.name, reason="no credentials")
                 continue
@@ -372,7 +403,8 @@ class LLMRouter:
                     )
                     return resp
         raise AllProvidersExhausted(
-            f"All {len(self.chain)} providers failed. Last error: {last_error}"
+            f"All {len(self.effective_chain)} providers failed. "
+            f"Last error: {last_error}"
         )
 
     async def aclose(self) -> None:
@@ -402,13 +434,14 @@ class LLMRouter:
         client = self._require_client()
         ep = model.endpoint
         headers = {"Authorization": f"Bearer {ep.api_key}", **ep.extra_headers}
-        body = {
+        body: dict[str, Any] = {
             "model": model.slug,
             "messages": to_openai_messages(trim_for_send(conv)),
-            "tools": tools_for_dialect("openai"),
-            "tool_choice": "auto",
             "max_tokens": self._effective_output(model),
         }
+        if not self._suppress_tools:
+            body["tools"] = tools_for_dialect("openai")
+            body["tool_choice"] = "auto"
         data = await self._post_json(client, f"{ep.base_url}/chat/completions",
                                      headers, body)
         choice = data["choices"][0]["message"]
@@ -430,21 +463,22 @@ class LLMRouter:
         client = self._require_client()
         ep = model.endpoint
         headers = {"x-api-key": ep.api_key or "", **ep.extra_headers}
-        # Engine 8: mark the stable system prompt and tool manifest as cacheable
-        # so Anthropic prompt-caching reuses those tokens across turns.
-        tools = tools_for_dialect("anthropic")
-        if tools:
-            tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
-        body = {
+        body: dict[str, Any] = {
             "model": model.slug,
             "system": [
                 {"type": "text", "text": conv.system_prompt,
                  "cache_control": {"type": "ephemeral"}}
             ],
             "messages": to_anthropic_messages(trim_for_send(conv)),
-            "tools": tools,
             "max_tokens": self._effective_output(model),
         }
+        if not self._suppress_tools:
+            # Engine 8: mark the stable tool manifest as cacheable so prompt
+            # caching reuses those tokens across turns.
+            tools = tools_for_dialect("anthropic")
+            if tools:
+                tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+            body["tools"] = tools
         data = await self._post_json(client, f"{ep.base_url}/messages",
                                      headers, body)
         text_parts: list[str] = []
@@ -477,17 +511,16 @@ class LLMRouter:
             f"{ep.base_url}/models/{model.slug}:generateContent"
             f"?key={ep.api_key}"
         )
-        decls = [
-            t["function"] for t in tools_for_dialect("openai")
-        ]
-        body = {
+        body: dict[str, Any] = {
             "system_instruction": {"parts": [{"text": conv.system_prompt}]},
             "contents": to_gemini_contents(trim_for_send(conv)),
-            "tools": [{"function_declarations": decls}],
             "generationConfig": {
                 "maxOutputTokens": self._effective_output(model)
             },
         }
+        if not self._suppress_tools:
+            decls = [t["function"] for t in tools_for_dialect("openai")]
+            body["tools"] = [{"function_declarations": decls}]
         data = await self._post_json(client, url, {}, body)
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []

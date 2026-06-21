@@ -32,8 +32,10 @@ from orchestrator import Orchestrator, StepRecord
 from skills import Skill, SkillRegistry, seed_example_skills
 from tools_manifest import ALL_TOOLS
 from memory_rag import MemoryRAG
+from ast_memory import ASTMemory
 from telemetry import Telemetry, TelemetryThrottler
 from swarm_bus import SwarmCoordinator
+from intent import Intent, classify_intent
 
 try:
     from rich.console import Console
@@ -76,14 +78,17 @@ class OqloCLI:
         self.skills = SkillRegistry()
         # Next-gen engines.
         self.memory = MemoryRAG()
+        self.ast_memory = ASTMemory()
         self.telemetry = Telemetry()
         self.throttle = TelemetryThrottler(telemetry=self.telemetry)
+        self.auto_intent = True  # Module 1: hybrid chat/agentic routing.
         self.verbose = True
         self.running = True
         self._last_events: list[str] = []
         self.commands: dict[str, Callable[[list[str]], Awaitable[None]]] = {
             "start": self.cmd_start,
             "help": self.cmd_help,
+            "model": self.cmd_model,
             "api": self.cmd_api,
             "local": self.cmd_local,
             "swarm": self.cmd_swarm,
@@ -188,6 +193,9 @@ class OqloCLI:
                 ("/status", "Active model, policy, bridges, token settings."),
             ],
             "Providers & routing (priority: 1.antigravity 2.cursor 3.codex 4.api)": [
+                ("/model <slug>", "Override the active engine live (any OpenRouter or "
+                                  "native slug), e.g. /model nvidia/nemotron-3-ultra:free "
+                                  "or /model anthropic/claude-4.6-opus. /model reset to revert."),
                 ("/api list", "Show API key status for every cloud provider."),
                 ("/api <provider> <key>", "Bind a key live, e.g. /api openrouter sk-..."),
                 ("/api <provider> clear", "Remove a bound key."),
@@ -205,9 +213,13 @@ class OqloCLI:
             ],
             "Next-gen engines": [
                 ("/swarm <task>", "Run the 4-agent swarm (Architect/Blender/Unity/QA)."),
-                ("/memory ...", "Long-term RAG: stats/search <q>/add <text>/forget <id>."),
+                ("/memory ...", "RAG: stats/search <q>/add <text>/forget <id>/ast."),
                 ("/telemetry", "Live CPU/RAM/GPU-VRAM + throttle stats."),
                 ("/budget [limit <usd>|resume]", "Financial velocity guard ($/min)."),
+            ],
+            "Hybrid chat (plain text auto-routes)": [
+                ("just type a question", "Chat goes straight to the model — no pipeline."),
+                ("just type an instruction", "Actionable work spins up the agent pipeline."),
             ],
             "Bridges (terminal-only — never launches apps)": [
                 ("/tools", "LLM-accessible bridge tools."),
@@ -323,6 +335,40 @@ class OqloCLI:
         console.print(f"[green]{name} {'activated' if args[1]=='on' else 'deactivated'}.[/green]")
         self._rebuild_chain()
 
+    # --- Module 1: live model override ----------------------------------- #
+    async def cmd_model(self, args: list[str]) -> None:
+        if not args:
+            cur = self.router.override_model
+            if cur:
+                console.print(f"Active override: [bold]{cur.slug}[/] "
+                              f"({cur.provider.value})")
+            else:
+                console.print("No override. Using the priority chain: "
+                              f"[bold]{self.router.active_model.name}[/]")
+            console.print("[dim]Usage: /model <provider/model:tier>  · "
+                          "/model reset  · examples:\n"
+                          "  /model anthropic/claude-4.6-opus\n"
+                          "  /model nvidia/nemotron-3-ultra-550b-a55b:free\n"
+                          "  /model gpt-5.5-pro[/dim]")
+            return
+        if args[0] in ("reset", "clear", "default"):
+            self.router.clear_override()
+            console.print("[green][SYSTEM] Model override cleared. "
+                          "Reverting to the priority chain.[/green]")
+            return
+        slug = args[0]
+        model = config.make_model_for_slug(slug)
+        if not model.is_available:
+            ep = model.endpoint
+            console.print(
+                f"[yellow][SYSTEM] '{slug}' routes via {model.provider.value} "
+                f"but no key is set. Bind one: /api {model.provider.value} "
+                f"<key>[/yellow]")
+        self.router.set_override(model)
+        console.print(
+            f"[bold green][SYSTEM] Target engine successfully switched to: "
+            f"{slug}[/bold green] [dim]({model.provider.value})[/dim]")
+
     # --- token-saving toggles -------------------------------------------- #
     async def cmd_tokensave(self, args: list[str]) -> None:
         b = config.TOKEN_BUDGET
@@ -393,8 +439,22 @@ class OqloCLI:
         elif sub == "forget" and len(args) > 1:
             ok = self.memory.forget(args[1])
             console.print("[green]Forgotten.[/green]" if ok else "[red]Not found.[/red]")
+        elif sub == "ast":
+            s = self.ast_memory.stats()
+            t = Table(title="AST Incremental Memory", box=box.ROUNDED,
+                      header_style="bold cyan")
+            t.add_column("qualname")
+            t.add_column("kind")
+            t.add_column("v", justify="right")
+            t.add_column("signature")
+            for u in list(self.ast_memory.units.values())[:25]:
+                t.add_row(u.qualname, u.kind, str(u.version), u.signature)
+            console.print(t)
+            console.print(f"[dim]{s['units']} units · {s['versioned']} versioned "
+                          f"· {s['path']}[/dim]")
         else:
-            console.print("[red]Usage: /memory stats|search <q>|add <text>|forget <id>[/red]")
+            console.print("[red]Usage: /memory stats|search <q>|add <text>|"
+                          "forget <id>|ast[/red]")
 
     # --- Engine 7: telemetry --------------------------------------------- #
     async def cmd_telemetry(self, _: list[str]) -> None:
@@ -524,9 +584,15 @@ class OqloCLI:
         t.add_column("State")
         b = config.TOKEN_BUDGET
         api_on = "[green]yes[/]" if config.any_api_key_configured() else "[red]no[/]"
+        override = self.router.override_model
         t.add_row("Routing policy", self.policy.value)
         t.add_row("Priority", "1.antigravity → 2.cursor → 3.codex → 4.api")
         t.add_row("Active model", self.router.active_model.name)
+        t.add_row("Model override",
+                  f"[bold]{override.slug}[/] ({override.provider.value})"
+                  if override else "[dim]none (priority chain)[/]")
+        t.add_row("Hybrid intent router",
+                  "[green]on[/]" if self.auto_intent else "[red]off[/]")
         t.add_row("Chain length", str(len(self.router.chain)))
         t.add_row("API key configured", api_on)
         t.add_row("Mode", "terminal-only (never launches apps)")
@@ -536,7 +602,12 @@ class OqloCLI:
         t.add_row("Host CPU / MEM",
                   f"{snap.cpu_percent:.0f}% / {snap.mem_percent:.0f}%"
                   + (f" · VRAM {snap.vram_label}" if snap.vram_percent else ""))
-        t.add_row("Memory records", str(self.memory.stats()["records"]))
+        t.add_row("Memory cache",
+                  f"{self.memory.stats()['records']} docs · "
+                  f"{self.ast_memory.stats()['units']} AST units")
+        t.add_row("Session spend",
+                  f"${self.router.session_cost_usd:.6f} "
+                  f"({self.router.session_usage.input_tokens + self.router.session_usage.output_tokens:,} tok)")
         t.add_row("Budget guard",
                   f"${self.router.cost_guard.max_usd_per_min:.2f}/min limit"
                   + (" [red](FROZEN)[/]" if self.router.cost_guard.frozen else ""))
@@ -613,8 +684,14 @@ class OqloCLI:
         console.print(f"[green]Loaded {len(self.conv.messages)} messages.[/green]")
 
     async def cmd_clear(self, _: list[str]) -> None:
+        # Clear the screen and flush the transient short-term chat buffer, while
+        # preserving the long-term semantic + AST memory matrices.
+        console.clear()
         self.conv = Conversation(config.SYSTEM_PROMPT)
-        console.print("[green]Conversation reset.[/green]")
+        console.print("[green]Screen cleared and short-term context flushed. "
+                      "Long-term memory preserved "
+                      f"({self.memory.stats()['records']} docs, "
+                      f"{self.ast_memory.stats()['units']} AST units).[/green]")
 
     async def cmd_export(self, _: list[str]) -> None:
         d = config.BRIDGES.fbx_export_dir
@@ -769,7 +846,32 @@ class OqloCLI:
             console.print(f"  [dim]{k}:[/] {v}")
 
     # ------------------------------------------------------------------ #
+    async def _chat(self, line: str) -> None:
+        """INTENT_CHAT fast path — direct, tool-free conversational turn."""
+        self.conv.user(line)
+        try:
+            resp = await self.router.chat(self.conv)
+        except Exception as exc:  # noqa: BLE001 - keep the REPL alive.
+            console.print(f"[red]Chat error: {exc}[/red]")
+            return
+        self.conv.assistant(resp.text, [])
+        console.print(Panel(resp.text or "[dim](no reply)[/dim]",
+                            title=f"💬 {resp.model.name}",
+                            border_style="cyan", box=box.ROUNDED))
+
+    async def _agentic(self, line: str) -> None:
+        orch = Orchestrator(
+            self.router, self.bridges, self.conv,
+            on_step=self._on_step, memory=self.memory,
+            ast_memory=self.ast_memory,
+        )
+        try:
+            await orch.run(line)
+        except Exception as exc:  # noqa: BLE001 - keep the REPL alive.
+            console.print(f"[red]Orchestration error: {exc}[/red]")
+
     async def dispatch(self, line: str) -> None:
+        # Module 1: slash commands are intercepted before any LLM node.
         if line.startswith("/"):
             parts = line[1:].split()
             if not parts:
@@ -780,15 +882,19 @@ class OqloCLI:
                 console.print(f"[red]Unknown command '/{cmd}'. Try /help.[/red]")
                 return
             await handler(args)
+            return
+
+        # Module 1: hybrid intent routing for plain text.
+        if not self.auto_intent:
+            await self._agentic(line)
+            return
+        intent = classify_intent(line)
+        if intent is Intent.CHAT:
+            console.print("[dim]↳ intent: chat (direct model, no pipeline)[/dim]")
+            await self._chat(line)
         else:
-            orch = Orchestrator(
-                self.router, self.bridges, self.conv,
-                on_step=self._on_step, memory=self.memory,
-            )
-            try:
-                await orch.run(line)
-            except Exception as exc:  # noqa: BLE001 - keep the REPL alive.
-                console.print(f"[red]Orchestration error: {exc}[/red]")
+            console.print("[dim]↳ intent: agentic (multi-agent pipeline)[/dim]")
+            await self._agentic(line)
 
     async def repl(self) -> None:
         await self.cmd_start([])

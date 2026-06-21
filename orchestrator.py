@@ -20,6 +20,7 @@ import config
 from bridges import BridgeRouter, ToolResult
 from llm_router import Conversation, LLMResponse, LLMRouter, ToolCall
 from memory_rag import MemoryRAG
+from ast_memory import ASTMemory
 
 
 @dataclass(slots=True)
@@ -51,6 +52,7 @@ class Orchestrator:
         max_heals_per_tool: int = 2,
         on_step: StepCallback | None = None,
         memory: MemoryRAG | None = None,
+        ast_memory: ASTMemory | None = None,
     ) -> None:
         self.router = router
         self.bridges = bridges
@@ -59,6 +61,7 @@ class Orchestrator:
         self.max_heals_per_tool = max_heals_per_tool
         self.on_step = on_step or (lambda _: None)
         self.memory = memory
+        self.ast_memory = ast_memory
         self._heal_counts: dict[str, int] = {}
 
     async def run(self, user_input: str) -> str:
@@ -135,6 +138,10 @@ class Orchestrator:
         if call.name == "execute_bpy_command" and call.arguments.get("code"):
             self.memory.remember(call.arguments["code"], kind="code",
                                  tags=["blender", "proven"])
+            # Module 2: fold the snippet into AST-granular incremental memory.
+            if self.ast_memory is not None:
+                self.ast_memory.ingest(call.arguments["code"],
+                                       tags=["blender", "proven"])
         elif call.name == "create_csharp_script" and call.arguments.get("source"):
             self.memory.remember(call.arguments["source"], kind="csharp",
                                  tags=["unity", "proven"])

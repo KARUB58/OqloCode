@@ -122,6 +122,47 @@ heal loop over the event bus.
 
 ---
 
+## Hybrid daily-driver mode
+
+Oqlo is both a macro-task executor and a conversational assistant. Every plain
+line first passes through a **zero-token intent classifier** (`intent.py`):
+
+* `INTENT_CHAT` — questions / chit-chat go **straight to the active model** with
+  no tools and no DAG, so casual use is cheap and instant.
+* `INTENT_AGENTIC` — actionable instructions spin up the full multi-agent
+  pipeline.
+
+The classifier is heuristic (verbs × domain nouns), so it adds no latency or
+spend. You'll see a `↳ intent: chat|agentic` tag on each line.
+
+### Live model override
+
+```
+/model anthropic/claude-4.6-opus
+/model nvidia/nemotron-3-ultra-550b-a55b:free   # any OpenRouter slug
+/model gpt-5.5-pro                              # native provider slug
+/model reset                                    # back to the priority chain
+```
+
+`/model <slug>` switches the active engine immediately and **bypasses the
+priority chain until reset** — `provider/model:tier` slugs route via OpenRouter;
+bare slugs map to their native provider. `/clear` wipes the screen and the
+short-term chat buffer but **preserves long-term memory** (RAG + AST).
+
+## Module 2 — AST Incremental Memory
+
+> The upgrade brief named this module but didn't include its detailed spec, so
+> `ast_memory.py` is a self-contained interpretation, open to revision.
+
+Instead of storing code as opaque text, it parses Python into **AST units**
+(functions, classes, methods) and folds new snippets in **incrementally**: a unit
+is added, updated (version bumped, with history), or skipped as unchanged — keyed
+by a normalized structural hash. This avoids duplicate blobs, enables
+function-level recall, and keeps the tokens later injected into prompts minimal.
+View it with `/memory ast`.
+
+---
+
 ## Install
 
 ```bash
@@ -141,7 +182,8 @@ Type `/help` inside the CLI. Highlights:
 | Command | Description |
 |---|---|
 | `/start oqlocode` | Show the banner and full system status |
-| `/status` | Active model, policy, bridges, token settings |
+| `/status` | Active model, override, policy, bridges, spend |
+| `/model <slug>` | Override the active engine live (`/model reset` to revert) |
 | `/api <provider> <key>` | Bind a cloud key live (`/api list` to view) |
 | `/local <name> on\|off` | Activate/deactivate a local executive |
 | `/models` | Model catalogue with cost & availability |
@@ -201,9 +243,11 @@ config.py            BYOK config, ModelProfile catalogue, PRIORITY_CHAIN, polici
 llm_router.py        Multi-provider async router + canonical↔dialect translation
 tools_manifest.py    Provider-neutral tool specs (rendered per dialect)
 orchestrator.py      The agent loop + self-healing + memory/cost-guard wiring
+intent.py            Module 1: zero-token chat/agentic intent classifier
 skills.py            User-extensible JSON skill registry
 swarm_bus.py         Engine 5: async event bus + 4 specialized agents
 memory_rag.py        Engine 6: TF-IDF semantic long-term memory
+ast_memory.py        Module 2: AST-granular incremental code memory
 telemetry.py         Engines 7 & 9: host telemetry, throttling, cost guard
 sandbox.py           Engine 10: pre-flight QA sandbox for bpy/C#
 main.py              Rich-powered interactive terminal
