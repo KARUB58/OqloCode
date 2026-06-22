@@ -17,12 +17,14 @@ from .result import ToolResult
 from .blender_bridge import BlenderBridge
 from .unity_bridge import UnityBridge
 from .cursor_bridge import CursorBridge
+from .fs_bridge import FSBridge
 
 __all__ = [
     "ToolResult",
     "BlenderBridge",
     "UnityBridge",
     "CursorBridge",
+    "FSBridge",
     "BridgeRouter",
 ]
 
@@ -34,6 +36,7 @@ class BridgeRouter:
         self.blender = BlenderBridge()
         self.unity = UnityBridge()
         self.cursor = CursorBridge()
+        self.fs = FSBridge()
         self._dispatch = {
             "execute_bpy_command": self.blender.execute_bpy_command,
             "export_active_scene_to_fbx": self.blender.export_active_scene_to_fbx,
@@ -42,6 +45,10 @@ class BridgeRouter:
             "get_editor_logs": self.unity.get_editor_logs,
             "patch_workspace_file": self.cursor.patch_workspace_file,
             "set_antigravity_model_preset": self.cursor.set_antigravity_model_preset,
+            "read_file": self.fs.read_file,
+            "write_file": self.fs.write_file,
+            "edit_file": self.fs.edit_file,
+            "list_directory": self.fs.list_directory,
         }
 
     async def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:

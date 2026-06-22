@@ -145,6 +145,13 @@ class Orchestrator:
         elif call.name == "create_csharp_script" and call.arguments.get("source"):
             self.memory.remember(call.arguments["source"], kind="csharp",
                                  tags=["unity", "proven"])
+        elif call.name in ("write_file", "edit_file"):
+            # FS bridge: if it's Python source, fold into AST memory.
+            path = call.arguments.get("path", "")
+            if path.endswith(".py") and self.ast_memory is not None:
+                content = call.arguments.get("content") or call.arguments.get("new_string", "")
+                if content:
+                    self.ast_memory.ingest(content, tags=["fs", "written"])
 
     async def _execute_with_heal(self, call: ToolCall) -> ToolResult:
         """Execute a tool call, tracking self-heal budget per tool name."""

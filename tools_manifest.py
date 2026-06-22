@@ -245,6 +245,122 @@ SET_ANTIGRAVITY_MODEL_PRESET = ToolSpec(
 )
 
 
+# --------------------------------------------------------------------------- #
+# Filesystem tools — read / write / edit / list local files
+# --------------------------------------------------------------------------- #
+READ_FILE = ToolSpec(
+    name="read_file",
+    description=(
+        "Read the contents of any local file and return them as text. "
+        "Use this to inspect source code, configs, or data before editing. "
+        "Output is capped at 12,000 characters; large files are truncated."
+    ),
+    bridge="fs",
+    parameters=_obj(
+        {
+            "path": {
+                "type": "string",
+                "description": "Absolute or home-relative (~) path to the file.",
+            },
+            "encoding": {
+                "type": "string",
+                "description": "Text encoding (default 'utf-8').",
+                "default": "utf-8",
+            },
+        },
+        required=["path"],
+    ),
+)
+
+WRITE_FILE = ToolSpec(
+    name="write_file",
+    description=(
+        "Write (or overwrite) a local file with the given content. "
+        "Parent directories are created automatically. "
+        "Use this to save generated code or modified files to disk."
+    ),
+    bridge="fs",
+    parameters=_obj(
+        {
+            "path": {
+                "type": "string",
+                "description": "Absolute or home-relative (~) destination path.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Full text content to write to the file.",
+            },
+            "encoding": {
+                "type": "string",
+                "description": "Text encoding (default 'utf-8').",
+                "default": "utf-8",
+            },
+        },
+        required=["path", "content"],
+    ),
+)
+
+EDIT_FILE = ToolSpec(
+    name="edit_file",
+    description=(
+        "Make a surgical in-place edit to a local file by replacing an exact "
+        "string with a new one. The old_string must match exactly once — if it "
+        "appears multiple times, include extra surrounding lines to make it unique. "
+        "Prefer this over write_file for targeted changes to existing files."
+    ),
+    bridge="fs",
+    parameters=_obj(
+        {
+            "path": {
+                "type": "string",
+                "description": "Absolute or home-relative (~) path to the file.",
+            },
+            "old_string": {
+                "type": "string",
+                "description": (
+                    "The exact text to find and replace. Must be unique in the file. "
+                    "Include surrounding lines if needed to disambiguate."
+                ),
+            },
+            "new_string": {
+                "type": "string",
+                "description": "The text to replace old_string with.",
+            },
+            "encoding": {
+                "type": "string",
+                "description": "Text encoding (default 'utf-8').",
+                "default": "utf-8",
+            },
+        },
+        required=["path", "old_string", "new_string"],
+    ),
+)
+
+LIST_DIRECTORY = ToolSpec(
+    name="list_directory",
+    description=(
+        "List the files and subdirectories inside a local directory. "
+        "Returns names, types (file/dir), and file sizes. "
+        "Use this to explore a project before reading or editing specific files."
+    ),
+    bridge="fs",
+    parameters=_obj(
+        {
+            "path": {
+                "type": "string",
+                "description": "Absolute or home-relative (~) directory path.",
+            },
+            "max_entries": {
+                "type": "integer",
+                "description": "Maximum number of entries to return (default 200).",
+                "default": 200,
+            },
+        },
+        required=["path"],
+    ),
+)
+
+
 ALL_TOOLS: Final[tuple[ToolSpec, ...]] = (
     EXECUTE_BPY_COMMAND,
     EXPORT_ACTIVE_SCENE_TO_FBX,
@@ -253,6 +369,10 @@ ALL_TOOLS: Final[tuple[ToolSpec, ...]] = (
     GET_EDITOR_LOGS,
     PATCH_WORKSPACE_FILE,
     SET_ANTIGRAVITY_MODEL_PRESET,
+    READ_FILE,
+    WRITE_FILE,
+    EDIT_FILE,
+    LIST_DIRECTORY,
 )
 
 TOOLS_BY_NAME: Final[dict[str, ToolSpec]] = {t.name: t for t in ALL_TOOLS}
