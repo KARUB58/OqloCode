@@ -251,9 +251,8 @@ SET_ANTIGRAVITY_MODEL_PRESET = ToolSpec(
 READ_FILE = ToolSpec(
     name="read_file",
     description=(
-        "Read the contents of any local file and return them as text. "
-        "Use this to inspect source code, configs, or data before editing. "
-        "Output is capped at 12,000 characters; large files are truncated."
+        "Read the full contents of any local file and return them as text. "
+        "Use this to inspect source code, configs, or data before editing."
     ),
     bridge="fs",
     parameters=_obj(

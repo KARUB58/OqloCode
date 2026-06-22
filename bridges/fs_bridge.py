@@ -12,9 +12,6 @@ from pathlib import Path
 
 from .result import ToolResult
 
-_MAX_READ_CHARS: int = 12_000  # hard cap to keep tool results inside token budget
-
-
 class FSBridge:
     """Read / write / edit / list local files."""
 
@@ -41,18 +38,11 @@ class FSBridge:
                     error="Path is a directory.",
                 )
             content = target.read_text(encoding=encoding, errors="replace")
-            truncated = len(content) > _MAX_READ_CHARS
-            if truncated:
-                content = content[:_MAX_READ_CHARS]
             lines = len(content.splitlines())
-            suffix = (
-                f"\n\n[TRUNCATED — showing first {_MAX_READ_CHARS:,} chars of {target}]"
-                if truncated else ""
-            )
             return ToolResult(
                 ok=True, tool="read_file",
-                summary=f"Read {target.name} ({lines} lines{', truncated' if truncated else ''})",
-                data={"path": str(target), "content": content + suffix, "lines": lines},
+                summary=f"Read {target.name} ({lines} lines)",
+                data={"path": str(target), "content": content, "lines": lines},
             )
         except OSError as exc:
             return ToolResult(ok=False, tool="read_file", summary=str(exc), error=str(exc))
