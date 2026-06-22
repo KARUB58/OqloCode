@@ -125,6 +125,7 @@ class OqloCLI:
             "verbose": self.cmd_verbose,
             "write": self.cmd_write,
             "file": self.cmd_file,
+            "autosave": self.cmd_autosave,
             "workspace": self.cmd_workspace,
             "ws": self.cmd_workspace,
             "quit": self.cmd_quit,
@@ -273,6 +274,9 @@ class OqloCLI:
                  "the active file (or any path you specify)."),
                 ("/file show|clear",
                  "Show info about the active session or clear it."),
+                ("/autosave on|off|threshold <N>",
+                 "Toggle auto-save (default on). Changes ≤ threshold lines "
+                 "are saved silently; larger changes ask for approval."),
             ],
             "Bridges (terminal-only — never launches apps)": [
                 ("/tools", "LLM-accessible bridge tools."),
@@ -438,6 +442,104 @@ class OqloCLI:
             console.print("[dim]↳ intent: agentic (multi-agent pipeline)[/dim]")
             await self._agentic(augmented)
 
+        # After any file-session response, check whether to auto-save.
+        await self._maybe_auto_save(task)
+
+    # --- auto-save logic -------------------------------------------------- #
+    # Threshold: code blocks with more lines than this trigger an approval
+    # prompt; smaller blocks (or explicit /autosave off) skip the prompt.
+    _AUTO_SAVE_THRESHOLD: int = 40
+
+    async def _maybe_auto_save(self, hint: str = "") -> None:
+        """Find the last code block in the conversation and save it.
+
+        * Lines ≤ threshold  → auto-save silently (green tick).
+        * Lines > threshold  → show a preview and ask [y/N] before writing.
+        * No active_file     → nothing to do (directory sessions skip auto-save).
+        """
+        import re
+
+        if not getattr(self, "_autosave_enabled", True):
+            return  # user disabled auto-save
+        if not self.active_file:
+            return  # directory sessions don't auto-save (no single target)
+
+        # Find the most recent assistant message that contains a code block.
+        code: str | None = None
+        for m in reversed(self.conv.messages):
+            if m.role == "assistant" and m.text:
+                blocks = re.findall(r"```(?:\w+)?\n([\s\S]*?)```", m.text)
+                if blocks:
+                    code = max(blocks, key=len)
+                    break
+        if code is None or not code.strip():
+            return
+
+        lines = code.splitlines()
+        target = self.active_file
+
+        # Determine whether the change is "important" (needs approval).
+        existing_lines = 0
+        if target.exists():
+            try:
+                existing_lines = len(
+                    target.read_text(encoding="utf-8", errors="replace").splitlines()
+                )
+            except OSError:
+                pass
+        new_lines = len(lines)
+        # Important if: new file, or block is large, or replaces > 60% of file.
+        is_important = (
+            not target.exists()
+            or new_lines > self._AUTO_SAVE_THRESHOLD
+            or (existing_lines > 0
+                and abs(new_lines - existing_lines) / existing_lines > 0.6)
+        )
+
+        if not is_important:
+            # Small change — write silently.
+            try:
+                target.write_text(code, encoding="utf-8")
+                console.print(
+                    f"[dim green]✓ auto-saved → {target.name} "
+                    f"({new_lines} lines)[/dim green]"
+                )
+            except OSError as exc:
+                console.print(f"[red]Auto-save failed: {exc}[/red]")
+            return
+
+        # Large / important change — show a diff summary and ask.
+        console.print(Panel(
+            f"[bold]{target}[/]\n"
+            f"Current: [dim]{existing_lines} lines[/dim] → "
+            f"New: [bold]{new_lines} lines[/bold]\n\n"
+            + "\n".join(lines[:12])
+            + ("\n[dim]…[/dim]" if new_lines > 12 else ""),
+            title="💾 Save confirmation required",
+            border_style="yellow", box=box.ROUNDED,
+        ))
+        try:
+            answer = (
+                await asyncio.to_thread(
+                    input, "  Save to file? [y/N] → "
+                )
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+
+        if answer in ("y", "yes", "evet", "e"):
+            try:
+                target.write_text(code, encoding="utf-8")
+                console.print(
+                    f"[green]✓ Saved → {target} ({new_lines} lines).[/green]"
+                )
+            except OSError as exc:
+                console.print(f"[red]Save failed: {exc}[/red]")
+        else:
+            console.print(
+                "[dim]Not saved. Use /write to save manually later.[/dim]"
+            )
+
     # --- /write — apply last code block to active file -------------------- #
     async def cmd_write(self, args: list[str]) -> None:
         """Write the last code block from the conversation to the active file."""
@@ -508,6 +610,58 @@ class OqloCLI:
                 )
         else:
             console.print("[red]Usage: /file show|clear[/red]")
+
+    # --- /autosave — toggle auto-save feature ------------------------------ #
+    async def cmd_autosave(self, args: list[str]) -> None:
+        """Toggle or configure the auto-save feature.
+
+        Usage:
+          /autosave            → show status
+          /autosave on|off     → enable / disable
+          /autosave threshold <N>  → set line threshold (default 40)
+        """
+        sub = args[0].lower() if args else "status"
+
+        if sub in ("on", "enable"):
+            self._autosave_enabled = True
+            console.print(
+                f"[green]✓ Auto-save ON[/green]  "
+                f"(threshold: {self._AUTO_SAVE_THRESHOLD} lines — "
+                "changes above that size will ask for approval)"
+            )
+
+        elif sub in ("off", "disable"):
+            self._autosave_enabled = False
+            console.print(
+                "[yellow]Auto-save OFF.[/yellow]  "
+                "Use [bold]/write[/bold] to save manually."
+            )
+
+        elif sub == "threshold":
+            if len(args) < 2 or not args[1].isdigit():
+                console.print("[red]Usage: /autosave threshold <number>[/red]")
+                return
+            self.__class__._AUTO_SAVE_THRESHOLD = int(args[1])
+            console.print(
+                f"[green]✓ Threshold set to {self._AUTO_SAVE_THRESHOLD} lines.[/green]"
+            )
+
+        else:  # status
+            enabled = getattr(self, "_autosave_enabled", True)
+            status_str = "[green]ON[/green]" if enabled else "[yellow]OFF[/yellow]"
+            active_path = self.active_file or self.active_dir
+            console.print(Panel(
+                f"Auto-save: {status_str}\n"
+                f"Threshold: [bold]{self._AUTO_SAVE_THRESHOLD}[/bold] lines "
+                "(above → approval prompt, below → silent save)\n"
+                f"Active target: [dim]{active_path or 'none'}[/dim]\n\n"
+                "[dim]Commands:[/dim]\n"
+                "  /autosave on|off\n"
+                "  /autosave threshold <N>\n"
+                "  /write [path]  — save last code block manually",
+                title="💾 Auto-Save",
+                border_style="cyan", box=box.ROUNDED,
+            ))
 
     # ------------------------------------------------------------------ #
     # /workspace — multi-project workspace module
